@@ -78,8 +78,12 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "attn_norm", il);
 
         // self-attention
-        {
-            // compute Q and K and RoPE them
+        // The experimental builder is disabled unless LLAMA_RVV1024_GRAPH=1.
+        // It is a graph skeleton, NOT an executable fused kernel yet.
+        if (ggml_tensor * rvv = build_attn_rvv1024_qwen2(model.layers[il], cur, inp_pos, inp_attn, il)) {
+            cur = rvv;
+        } else {
+            // Standard llama.cpp path (unchanged): QKV, RoPE, cache, attention, W_O.
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 

@@ -1144,6 +1144,17 @@ struct llm_graph_context {
                      int   il) const;
 
 
+    // Experimental 1024-bit RVV attention sublayer graph builder.
+    // Returns nullptr for disabled/unsupported cases so the normal Qwen2 graph is used.
+    // When enabled, emits separate K/V cache writes and a custom Q->attn->W_O node.
+    // The custom kernel is deliberately unimplemented in this first scaffolding patch.
+    ggml_tensor * build_attn_rvv1024_qwen2(
+            const llama_layer & layer,
+                  ggml_tensor * x_norm,
+                  ggml_tensor * inp_pos,
+            llm_graph_input_attn_kv * inp,
+                          int il) const;
+
     // compute Q, K, V projections with optional bias and reshape
     // supports both fused wqkv and separate wq/wk/wv paths
     llm_graph_qkv build_qkv(
