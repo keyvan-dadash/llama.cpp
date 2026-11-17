@@ -1165,6 +1165,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+        // An rvv1024 suffix is an opaque model-lifetime I8 byte blob.
+        const bool rvv1024_packed = tn.suffix && strcmp(tn.suffix, "rvv1024") == 0;
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
@@ -1198,10 +1200,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
 
+        if (rvv1024_packed && (t_meta->type != GGML_TYPE_I8 || ggml_n_dims(t_meta) != 1)) {
+            throw std::runtime_error(format("packed tensor %s must be 1D GGML_TYPE_I8",
+                                            tn.str().c_str()));
+        }
+
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
         // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+        if (rvv1024_packed) {
+            op = GGML_OP_NONE; // never run a regular GGML I8 matmul support probe
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
                 (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
@@ -1242,10 +1251,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
 
+        if (rvv1024_packed) {
+            // The SoA RVV kernel dereferences this tensor on the CPU.
+            buft_list = buft_list_cpu;
+        }
+
         ggml_backend_buffer_type_t buft = nullptr;
 
-        // check overrides
-        if (tensor_buft_overrides) {
+        // Overrides must not relocate the raw RVV weights to a GPU buffer.
+        if (tensor_buft_overrides && !rvv1024_packed) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);

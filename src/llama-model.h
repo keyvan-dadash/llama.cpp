@@ -291,6 +291,11 @@ struct llama_layer {
     struct ggml_tensor * wk        = nullptr;
     struct ggml_tensor * wv        = nullptr;
     struct ggml_tensor * wo        = nullptr;
+    // Extra opaque column-SoA byte weights from the SAME repacked GGUF.
+    // Ordinary Q4_0 matrices above remain available for normal GGML.
+    struct ggml_tensor * wq_rvv1024 = nullptr;
+    struct ggml_tensor * wkv_rvv1024 = nullptr; // K/V interleaved, future writer
+    struct ggml_tensor * wo_rvv1024 = nullptr;
     struct ggml_tensor * wqkv      = nullptr;
     struct ggml_tensor * wg        = nullptr;
     struct ggml_tensor * wq_a      = nullptr;

@@ -1,4 +1,5 @@
 #include "models.h"
+#include "rvv1024_fused.h"
 
 void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -37,6 +38,19 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
 
         create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
+
+        // These additional I8 tensors are opaque packed byte blobs in the same
+        // GGUF. Do not replace the original Q4_0 W_Q, W_K, W_V, or W_O.
+        if (n_embd == 1536 && n_head == 12 && n_head_kv == 2 &&
+            n_embd_head_k == 128 && n_embd_head_v == 128 && n_layer == 28) {
+            namespace rv = spacemit_kernels::rvv::fused1024;
+            layer.wq_rvv1024 = create_tensor(tn(LLM_TENSOR_ATTN_Q, "rvv1024", i),
+                {static_cast<int64_t>(rv::Q_PACKED_BYTES)}, TENSOR_NOT_REQUIRED);
+            layer.wkv_rvv1024 = create_tensor(tn(LLM_TENSOR_ATTN_K, "rvv1024", i),
+                {static_cast<int64_t>(rv::KV_PACKED_BYTES)}, TENSOR_NOT_REQUIRED);
+            layer.wo_rvv1024 = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "rvv1024", i),
+                {static_cast<int64_t>(rv::WO_PACKED_BYTES)}, TENSOR_NOT_REQUIRED);
+        }
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
