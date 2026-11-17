@@ -2,6 +2,9 @@
 
 #include "ggml.h"
 
+#include <cmath>
+#include <cstring>
+
 // GCC's standard RVV header, NOT the SpacemiT/IME intrinsic interface.
 #if defined(__riscv_v) && defined(__riscv_v_intrinsic)
 #    include <riscv_vector.h>
@@ -40,14 +43,19 @@ void forward_kv_project(const ggml_compute_params * params, ggml_tensor * dst) {
 }
 
 bool prefill_kernel_ready() noexcept {
-    // IMPORTANT: do not turn this on until the numerical kernel is implemented,
-    // its packed-weight resources are alive, and full/hybrid Y is correct.
+    // The current three-head kernel consumes ordinary GGML Q4_0 weights, so it
+    // needs no offline repacker or TCM. The graph builder checks the restricted
+    // Qwen2 model/RoPE/KV contract before selecting this experimental path.
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    return hardware_vlen_supported();
+#else
     return false;
+#endif
 }
 
 // One *actual* three-head RVV attention/W_O computation for a single group.
-// Review-only for now: the existing scheduler does not call this function and
-// prefill_kernel_ready() remains false. This correctness-first version reads
+// Called by forward_q_attn_wo only for the explicitly enabled experimental
+// path on compatible A100 workers. This correctness-first version reads
 // ordinary GGML row-major Q4_0 weights; the future column-SoA repacker will
 // replace its strided weight loads, not its three-head attention algorithm.
 //
@@ -361,29 +369,35 @@ bool prefill_kernel_ready() noexcept {
 #endif // standard RVV available
 
 void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata) {
-    (void) userdata;
-    GGML_ASSERT(parts != nullptr && parts->data != nullptr &&
-                parts->ne[0] == HIDDEN_DIM && parts->ne[2] == N_Q_GROUPS &&
-                parts->ne[3] == 1);
-    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
-    // Check on the actual executing worker (not on the graph-building core).
-    if (ith < N_Q_GROUPS && !hardware_vlen_supported()) {
-        GGML_ABORT("RVV1024: worker %d is not on a 1024-bit RVV core", ith);
-    }
+    GGML_ASSERT(parts && parts->data &&
+                parts->type == GGML_TYPE_F32 && ggml_is_contiguous(parts) &&
+                parts->ne[0] == HIDDEN_DIM && parts->ne[1] > 1 &&
+                parts->ne[2] == N_Q_GROUPS && parts->ne[3] == 1);
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth && userdata);
 
-    // One three-head group owns one independent FP32 output slab. On a
-    // four-worker A100 pool, worker 0 owns Q[0..2], worker 1 Q[3..5], etc.
-    // If fewer workers are available, each worker handles multiple groups.
-    for (int group = ith; group < N_Q_GROUPS; group += nth) {
-        const int64_t first_q = group_first_q_head(group);
-        const int64_t kv_head = group_kv_head(group);
-        float * y_partial = static_cast<float *>(parts->data) +
-                            group * HIDDEN_DIM * parts->ne[1];
-        (void) first_q;
-        (void) kv_head;
-        (void) y_partial;
-        GGML_ABORT("RVV1024: three-head prefill math for group %d is not implemented", group);
+    // The GGML custom callback forwards a pointer to the config bytes stored
+    // in a graph-owned tensor's op_params. Copy to avoid aliasing assumptions.
+    prefill_rope_config rope;
+    std::memcpy(&rope, userdata, sizeof(rope));
+    GGML_ASSERT(std::isfinite(rope.base) && rope.base > 0.0f &&
+                std::isfinite(rope.freq_scale) && rope.freq_scale > 0.0f);
+
+    // GGML invokes each node on its prefill threadpool. Every active worker
+    // owns entire three-head groups, never individual heads. No concurrent
+    // writes to the same [group, token, hidden] FP32 output slab.
+    if (ith >= N_Q_GROUPS) {
+        return;
     }
+    GGML_ASSERT(prefill_kernel_ready()); // checks THIS worker's RVV width
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    for (int group = ith; group < N_Q_GROUPS; group += nth) {
+        // This processes all prompt tokens for three Q heads together:
+        // ONE shared K/V traversal, three softmax states, direct partial W_O.
+        fused_three_head_prefill_group(parts, group, rope.base, rope.freq_scale);
+    }
+#else
+    GGML_ABORT("RVV1024: fused prefill requires 1024-bit RVV with Zvfh");
+#endif
 }
 
 } // namespace spacemit_kernels::rvv::fused1024

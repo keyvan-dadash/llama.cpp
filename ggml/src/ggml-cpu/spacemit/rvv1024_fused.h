@@ -1,8 +1,8 @@
 #pragma once
 
 // Experimental GCC RVV 1,024-bit register-fused Qwen2 attention.
-// Interface and prefill dispatch only: arithmetic is NOT implemented yet.
-// The graph uses a capability probe so unfinished kernels cannot run.
+// Experimental three-head prefill using original GGML Q4_0 weights.
+// Hardware/model checks gate this path; A100 numerical testing is required.
 //
 // Source files live under spacemit/ for hardware organization, but use only
 // standard GCC RISC-V Vector facilities; IME/vendor compiler extensions are
@@ -39,6 +39,14 @@ inline constexpr const char * FORWARD_PROC = "ggml_cpu_rvv1024_prefill_forward";
 using prefill_ready_fn = bool (*)();
 using prefill_forward_fn = void (*)(ggml_tensor * parts, int ith, int nth, void * userdata);
 
+// Owned by a GGML graph-lifetime tensor's op_params (not a stack pointer).
+// For the first Qwen2 prefill path we support NEOX RoPE without YaRN scaling.
+struct prefill_rope_config {
+    float base;
+    float freq_scale;
+};
+static_assert(sizeof(prefill_rope_config) <= 64, "RoPE config must fit GGML op_params");
+
 // Pure non-RVV reduction: each worker writes different output elements.
 // Every group contributes to every Y coordinate; group slabs must never race.
 inline void reduce_partials_f32(const float * parts, float * y, int64_t nelements,
@@ -68,14 +76,15 @@ void repack_kv_q4_0_interleaved(const ggml_tensor * wk, const ggml_tensor * wv,
 // TODO: define GGML tensor source/side-effect contract and implement kernel.
 void forward_kv_project(const ggml_compute_params * params, ggml_tensor * dst);
 
-// This must remain false until real Q/W_O repacking, RVV math, mask/stride
-// handling and the full (or hybrid) output path are implemented and verified.
-// The graph builder falls back to ordinary Qwen2 while false.
+// Runtime hardware/compiler capability only. The graph builder independently
+// rejects unsupported model, RoPE, KV-cache and attention configurations.
+// This is still experimental and requires numerical validation on A100.
 bool prefill_kernel_ready() noexcept;
 
 // Signature EXACTLY matches ggml_custom_op_t. No fake ggml_compute_params.
 // Called on each GGML batch worker with its logical ith/nth. The implementation
 // owns scheduling group g = ith, ith+nth, ..., and writes ONLY partial[g].
+// userdata points to a graph-lifetime prefill_rope_config byte sequence.
 // No TCM, DMA, IME, or additional worker threads are involved.
 void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata);
 

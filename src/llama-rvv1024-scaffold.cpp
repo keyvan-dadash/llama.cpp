@@ -1,7 +1,7 @@
 // Experimental Qwen2 RVV1024 graph *scaffold*.
 //
-// This file routes prefill to an optional CPU backend. Until that backend is
-// numerically ready, even LLAMA_RVV1024_GRAPH=1 uses normal Qwen2 (no wrong Y).
+// This file routes explicitly enabled prefill to an optional RVV CPU backend.
+// Unsupported builds and model configurations continue on normal Qwen2.
 //
 // Graph contract:
 //   1. K/V use existing GGML projection, RoPE and cache-copy operations FOR NOW.
@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cmath>
 
 namespace {
 
@@ -60,7 +61,6 @@ static void rvv1024_kv_ready_fn(ggml_tensor * dst, int ith, int nth, void * user
 }
 
 static void rvv1024_q_attn_wo_fn(ggml_tensor * parts, int ith, int nth, void * userdata) {
-    (void) userdata;
     const auto reg = rvv1024_cpu_reg();
     const auto forward = reg ? reinterpret_cast<spacemit_kernels::rvv::fused1024::prefill_forward_fn>(
             ggml_backend_reg_get_proc_address(reg, spacemit_kernels::rvv::fused1024::FORWARD_PROC)) : nullptr;
@@ -68,7 +68,7 @@ static void rvv1024_q_attn_wo_fn(ggml_tensor * parts, int ith, int nth, void * u
         GGML_ABORT("RVV1024 CPU prefill backend disappeared after graph construction");
     }
     // EXACT custom callback ABI; the backend maps ith/nth onto three-head groups.
-    forward(parts, ith, nth, nullptr);
+    forward(parts, ith, nth, userdata);
 }
 
 static void rvv1024_reduce_partials_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
@@ -92,8 +92,8 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
               ggml_tensor * inp_pos,
   llm_graph_input_attn_kv * inp,
                       int il) const {
-    // Stage 1 is only the interface. The actual Q/attention/W_O arithmetic is
-    // still a stub; NEVER build a custom graph that could return incomplete Y.
+    // Experimental path. The CPU backend checks the RVV hardware; the model
+    // and RoPE restrictions below keep unsupported configurations on GGML.
     if (!rvv1024_graph_requested() || !rvv1024_backend_ready()) {
         return nullptr;
     }
@@ -104,6 +104,11 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     if (n_embd != 1536 || n_head != 12 || n_head_kv != 2 ||
         n_embd_head_k != 128 || n_embd_head_v != 128 || n_rot != 128 ||
         n_tokens <= 1 || ubatch.n_seqs_unq != 1 || cparams.training ||
+        !cparams.causal_attn || rope_type != GGML_ROPE_TYPE_NEOX ||
+        ext_factor != 0.0f || attn_factor != 1.0f ||
+        !std::isfinite(freq_base) || freq_base <= 0.0f ||
+        !std::isfinite(freq_scale) || freq_scale <= 0.0f ||
+        hparams.f_max_alibi_bias != 0.0f ||
         hparams.f_clamp_kqv > 0.0f || hparams.attn_soft_cap ||
         !loras->empty() ||
         !x_norm || x_norm->type != GGML_TYPE_F32 ||
@@ -158,8 +163,13 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
 
     // Inputs: X, Wq, Q bias, Wo, positions, K cache, V cache, causal
     // mask, and the KV-ready dependency. 9 < GGML_MAX_SRC (10).
-    // Future real kernel must also carry RoPE parameters using a graph-owned
-    // configuration (not a pointer to stack or global mutable state).
+    // GGML graph metadata owns the two RoPE scalars until graph execution
+    // finishes. Do not pass an address of local variables as custom userdata.
+    using spacemit_kernels::rvv::fused1024::prefill_rope_config;
+    const prefill_rope_config rope_cfg = { freq_base, freq_scale };
+    ggml_tensor * rope_params = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 2);
+    static_assert(sizeof(rope_cfg) <= sizeof(rope_params->op_params), "RoPE config too large");
+    std::memcpy(rope_params->op_params, &rope_cfg, sizeof(rope_cfg));
     ggml_tensor * args[] = {
         x_norm, layer.wq, layer.wq_b, layer.wo, inp_pos,
         k_cache, v_cache, inp->self_attn_mask.raw, kv_ready,
@@ -169,7 +179,7 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     ggml_tensor * parts = ggml_custom_4d(
             ctx0, GGML_TYPE_F32, n_embd, n_tokens,
             spacemit_kernels::rvv::fused1024::N_Q_GROUPS, 1,
-            args, 9, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, nullptr);
+            args, 9, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, rope_params->op_params);
     ggml_set_name(parts, "rvv1024_partial_y");
 
     // A separate graph node runs after all per-group workers have finished.
