@@ -39,10 +39,36 @@ void forward_kv_project(const ggml_compute_params * params, ggml_tensor * dst) {
     GGML_ABORT("RVV1024: K/V projection and cache update not implemented");
 }
 
-void forward_q_attn_wo(const ggml_compute_params * params, ggml_tensor * dst) {
-    (void) params;
-    (void) dst;
-    GGML_ABORT("RVV1024: register-fused Q/attention/W_O not implemented");
+bool prefill_kernel_ready() noexcept {
+    // IMPORTANT: do not turn this on until the numerical kernel is implemented,
+    // its packed-weight resources are alive, and full/hybrid Y is correct.
+    return false;
+}
+
+void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata) {
+    (void) userdata;
+    GGML_ASSERT(parts != nullptr && parts->data != nullptr &&
+                parts->ne[0] == HIDDEN_DIM && parts->ne[2] == N_Q_GROUPS &&
+                parts->ne[3] == 1);
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
+    // Check on the actual executing worker (not on the graph-building core).
+    if (ith < N_Q_GROUPS && !hardware_vlen_supported()) {
+        GGML_ABORT("RVV1024: worker %d is not on a 1024-bit RVV core", ith);
+    }
+
+    // One three-head group owns one independent FP32 output slab. On a
+    // four-worker A100 pool, worker 0 owns Q[0..2], worker 1 Q[3..5], etc.
+    // If fewer workers are available, each worker handles multiple groups.
+    for (int group = ith; group < N_Q_GROUPS; group += nth) {
+        const int64_t first_q = group_first_q_head(group);
+        const int64_t kv_head = group_kv_head(group);
+        float * y_partial = static_cast<float *>(parts->data) +
+                            group * HIDDEN_DIM * parts->ne[1];
+        (void) first_q;
+        (void) kv_head;
+        (void) y_partial;
+        GGML_ABORT("RVV1024: three-head prefill math for group %d is not implemented", group);
+    }
 }
 
 } // namespace spacemit_kernels::rvv::fused1024

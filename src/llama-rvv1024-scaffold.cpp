@@ -1,23 +1,23 @@
 // Experimental Qwen2 RVV1024 graph *scaffold*.
 //
-// This file deliberately does not implement the fused arithmetic yet. The normal
-// Qwen2 path is unchanged unless LLAMA_RVV1024_GRAPH=1. In that graph-only mode,
-// executing the fused node aborts loudly instead of silently returning wrong Y.
+// This file routes prefill to an optional CPU backend. Until that backend is
+// numerically ready, even LLAMA_RVV1024_GRAPH=1 uses normal Qwen2 (no wrong Y).
 //
 // Graph contract:
 //   1. K/V use existing GGML projection, RoPE and cache-copy operations FOR NOW.
 //   2. A KV-ready dependency node orders both cache writes before attention.
-//   3. One future CPU kernel will consume X/W_Q/W_O/position/cache/mask and
-//      produce FP32 Y directly, with Q, softmax state and O kept in RVV regs.
-//   4. The backend implementation will later own the TCMHelper and DMA lifecycle.
+//   3. CPU workers compute independent three-head FP32 partial-Y slabs.
+//   4. A separate GGML node reduces those slabs into the final FP32 Y.
 //
-// No custom hardware operations, manual TCM copies or multithreading here.
+// No TCM, DMA, IME, custom hardware operations or new threads here.
 
 #include "llama-graph.h"
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "rvv1024_fused.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +28,24 @@ namespace {
 static bool rvv1024_graph_requested() {
     const char * env = std::getenv("LLAMA_RVV1024_GRAPH");
     return env != nullptr && std::strcmp(env, "1") == 0;
+}
+
+// Only enable the graph once the CPU backend explicitly reports it can run.
+// Registry lookup avoids hard-linking llama to an optional ggml-cpu symbol.
+static ggml_backend_reg_t rvv1024_cpu_reg() {
+    return ggml_backend_reg_by_name("CPU");
+}
+
+static bool rvv1024_backend_ready() {
+    const auto reg = rvv1024_cpu_reg();
+    if (reg == nullptr) {
+        return false;
+    }
+    const auto ready = reinterpret_cast<spacemit_kernels::rvv::fused1024::prefill_ready_fn>(
+            ggml_backend_reg_get_proc_address(reg, spacemit_kernels::rvv::fused1024::READY_PROC));
+    const auto forward = ggml_backend_reg_get_proc_address(
+            reg, spacemit_kernels::rvv::fused1024::FORWARD_PROC);
+    return ready != nullptr && forward != nullptr && ready();
 }
 
 // Scheduling-only node: depends on *both* cache writes, producing an I32 token.
@@ -41,14 +59,29 @@ static void rvv1024_kv_ready_fn(ggml_tensor * dst, int ith, int nth, void * user
     }
 }
 
-static void rvv1024_q_attn_wo_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    (void) dst;
-    (void) ith;
-    (void) nth;
+static void rvv1024_q_attn_wo_fn(ggml_tensor * parts, int ith, int nth, void * userdata) {
     (void) userdata;
-    GGML_ABORT("LLAMA_RVV1024_GRAPH=1 built the experimental graph, but the "
-               "register-fused Q/attention/W_O kernel is not implemented yet; "
-               "unset LLAMA_RVV1024_GRAPH to use the normal Qwen2 path");
+    const auto reg = rvv1024_cpu_reg();
+    const auto forward = reg ? reinterpret_cast<spacemit_kernels::rvv::fused1024::prefill_forward_fn>(
+            ggml_backend_reg_get_proc_address(reg, spacemit_kernels::rvv::fused1024::FORWARD_PROC)) : nullptr;
+    if (!forward) {
+        GGML_ABORT("RVV1024 CPU prefill backend disappeared after graph construction");
+    }
+    // EXACT custom callback ABI; the backend maps ith/nth onto three-head groups.
+    forward(parts, ith, nth, nullptr);
+}
+
+static void rvv1024_reduce_partials_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) userdata;
+    const ggml_tensor * parts = dst->src[0];
+    GGML_ASSERT(parts && dst->type == GGML_TYPE_F32 && parts->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(parts));
+    GGML_ASSERT(parts->ne[0] == dst->ne[0] && parts->ne[1] == dst->ne[1] &&
+                parts->ne[2] == spacemit_kernels::rvv::fused1024::N_Q_GROUPS);
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
+    spacemit_kernels::rvv::fused1024::reduce_partials_f32(
+            static_cast<const float *>(parts->data), static_cast<float *>(dst->data),
+            dst->ne[0] * dst->ne[1], parts->ne[2], ith, nth);
 }
 
 } // namespace
@@ -59,7 +92,9 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
               ggml_tensor * inp_pos,
   llm_graph_input_attn_kv * inp,
                       int il) const {
-    if (!rvv1024_graph_requested()) {
+    // Stage 1 is only the interface. The actual Q/attention/W_O arithmetic is
+    // still a stub; NEVER build a custom graph that could return incomplete Y.
+    if (!rvv1024_graph_requested() || !rvv1024_backend_ready()) {
         return nullptr;
     }
 
@@ -68,7 +103,7 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     // Unsupported configurations must use the ordinary Qwen2 graph.
     if (n_embd != 1536 || n_head != 12 || n_head_kv != 2 ||
         n_embd_head_k != 128 || n_embd_head_v != 128 || n_rot != 128 ||
-        n_tokens < 1 || ubatch.n_seqs_unq != 1 || cparams.training ||
+        n_tokens <= 1 || ubatch.n_seqs_unq != 1 || cparams.training ||
         hparams.f_clamp_kqv > 0.0f || hparams.attn_soft_cap ||
         !loras->empty() ||
         !x_norm || x_norm->type != GGML_TYPE_F32 ||
@@ -129,10 +164,20 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
         x_norm, layer.wq, layer.wq_b, layer.wo, inp_pos,
         k_cache, v_cache, inp->self_attn_mask.raw, kv_ready,
     };
+    // [hidden, tokens, group, 1]. Each three-head group owns one nonoverlapping
+    // slab. No atomics or concurrent additions into the final output.
+    ggml_tensor * parts = ggml_custom_4d(
+            ctx0, GGML_TYPE_F32, n_embd, n_tokens,
+            spacemit_kernels::rvv::fused1024::N_Q_GROUPS, 1,
+            args, 9, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, nullptr);
+    ggml_set_name(parts, "rvv1024_partial_y");
+
+    // A separate graph node runs after all per-group workers have finished.
+    ggml_tensor * reduce_args[] = { parts };
     ggml_tensor * y = ggml_custom_4d(
             ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
-            args, 9, rvv1024_q_attn_wo_fn, 1, nullptr);
-    ggml_set_name(y, "rvv1024_q_attn_wo_UNIMPLEMENTED");
+            reduce_args, 1, rvv1024_reduce_partials_fn, GGML_N_TASKS_MAX, nullptr);
+    ggml_set_name(y, "rvv1024_attn_out");
     cb(y, "rvv1024_attn_out", il);
     ggml_build_forward_expand(gf, y);
     return y;

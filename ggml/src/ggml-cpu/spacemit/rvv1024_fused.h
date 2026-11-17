@@ -1,8 +1,8 @@
 #pragma once
 
 // Experimental GCC RVV 1,024-bit register-fused Qwen2 attention.
-// Template only: NO fused arithmetic, K/V interleaving or cache writes exist.
-// These entry points are intentionally not wired to the llama graph yet.
+// Interface and prefill dispatch only: arithmetic is NOT implemented yet.
+// The graph uses a capability probe so unfinished kernels cannot run.
 //
 // Source files live under spacemit/ for hardware organization, but use only
 // standard GCC RISC-V Vector facilities; IME/vendor compiler extensions are
@@ -21,7 +21,36 @@ inline constexpr int64_t HIDDEN_DIM     = 1536;
 inline constexpr int64_t HEAD_DIM       = 128;
 inline constexpr int64_t N_Q_HEADS      = 12;
 inline constexpr int64_t N_KV_HEADS     = 2;
-inline constexpr int64_t Q_HEADS_TILE   = 2;
+inline constexpr int64_t Q_HEADS_TILE   = 3;
+inline constexpr int64_t N_Q_GROUPS     = N_Q_HEADS / Q_HEADS_TILE;
+static_assert(N_Q_HEADS % Q_HEADS_TILE == 0, "Query heads must divide into groups");
+static_assert(N_Q_HEADS / N_KV_HEADS == 6, "Expected Qwen2 GQA 6:1 mapping");
+
+// Workers own disjoint [hidden, tokens] slabs of the [hidden, tokens, group]
+// partial tensor. Group g covers Q heads [3*g, 3*g+3); its KV head is g/2.
+inline constexpr int64_t group_first_q_head(int group) { return group * Q_HEADS_TILE; }
+inline constexpr int64_t group_kv_head(int group) {
+    return group_first_q_head(group) / (N_Q_HEADS / N_KV_HEADS);
+}
+
+// CPU backend extension procedure names, resolved from the GGML CPU registry.
+inline constexpr const char * READY_PROC = "ggml_cpu_rvv1024_prefill_ready";
+inline constexpr const char * FORWARD_PROC = "ggml_cpu_rvv1024_prefill_forward";
+using prefill_ready_fn = bool (*)();
+using prefill_forward_fn = void (*)(ggml_tensor * parts, int ith, int nth, void * userdata);
+
+// Pure non-RVV reduction: each worker writes different output elements.
+// Every group contributes to every Y coordinate; group slabs must never race.
+inline void reduce_partials_f32(const float * parts, float * y, int64_t nelements,
+                                int64_t groups, int ith, int nth) {
+    for (int64_t i = ith; i < nelements; i += nth) {
+        float sum = 0.0f;
+        for (int64_t g = 0; g < groups; ++g) {
+            sum += parts[g * nelements + i];
+        }
+        y[i] = sum;
+    }
+}
 
 // Checks physical RVV width only. True does NOT mean the kernel is ready.
 bool hardware_vlen_supported() noexcept;
@@ -39,10 +68,15 @@ void repack_kv_q4_0_interleaved(const ggml_tensor * wk, const ggml_tensor * wv,
 // TODO: define GGML tensor source/side-effect contract and implement kernel.
 void forward_kv_project(const ggml_compute_params * params, ggml_tensor * dst);
 
-// Planned graph node 2: X -> Q projection -> Q RoPE -> online GQA attention
-// -> Q8_0 quantization -> W_O projection -> FP32 Y, without materializing Q/O.
-// TODO: match the current src/llama-rvv1024-scaffold.cpp node sources,
-//       attach persistent packed weights, and implement RVV register fusion.
-void forward_q_attn_wo(const ggml_compute_params * params, ggml_tensor * dst);
+// This must remain false until real Q/W_O repacking, RVV math, mask/stride
+// handling and the full (or hybrid) output path are implemented and verified.
+// The graph builder falls back to ordinary Qwen2 while false.
+bool prefill_kernel_ready() noexcept;
+
+// Signature EXACTLY matches ggml_custom_op_t. No fake ggml_compute_params.
+// Called on each GGML batch worker with its logical ith/nth. The implementation
+// owns scheduling group g = ith, ith+nth, ..., and writes ONLY partial[g].
+// No TCM, DMA, IME, or additional worker threads are involved.
+void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata);
 
 } // namespace spacemit_kernels::rvv::fused1024

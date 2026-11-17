@@ -66,7 +66,10 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
+# The RVV1024 ABI header is declaration-only and safe to include on all CPUs.
+# The optional implementation remains exclusively in ggml-cpu.
+target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/spacemit)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

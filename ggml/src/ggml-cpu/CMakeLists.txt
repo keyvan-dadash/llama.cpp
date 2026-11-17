@@ -517,6 +517,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             if (GGML_CPU_ALL_VARIANTS)
                 message(FATAL_ERROR "GGML_CPU_RVV1024_FUSED does not support GGML_CPU_ALL_VARIANTS yet")
             endif()
+            if (NOT GGML_RV_ZFH OR NOT GGML_RV_ZVFH)
+                message(FATAL_ERROR "GGML_CPU_RVV1024_FUSED requires GGML_RV_ZFH and GGML_RV_ZVFH")
+            endif()
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_CPU_RVV1024_FUSED)
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/spacemit/rvv1024_fused.cpp
                 ggml-cpu/spacemit/rvv1024_fused.h

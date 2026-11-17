@@ -22,6 +22,10 @@
 #    include "spacemit/ime.h"
 #endif
 
+#ifdef GGML_CPU_RVV1024_FUSED
+#    include "spacemit/rvv1024_fused.h"
+#endif
+
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -656,6 +660,15 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#ifdef GGML_CPU_RVV1024_FUSED
+    namespace rvv1024 = spacemit_kernels::rvv::fused1024;
+    if (strcmp(name, rvv1024::READY_PROC) == 0) {
+        return (void *) rvv1024::prefill_kernel_ready;
+    }
+    if (strcmp(name, rvv1024::FORWARD_PROC) == 0) {
+        return (void *) rvv1024::forward_q_attn_wo;
+    }
+#endif
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;
