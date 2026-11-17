@@ -187,6 +187,9 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
+# Standard GCC / RVV kernel experiment; independent of GGML_CPU_RISCV64_SPACEMIT
+# and its optional vendor-instruction probes. No fused arithmetic exists yet.
+option(GGML_CPU_RVV1024_FUSED               "ggml: build GCC RVV1024 fused attention skeleton" OFF)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends

@@ -505,6 +505,24 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 list(APPEND GGML_CPU_SOURCES ggml-cpu/spacemit/ime2_kernels.cpp)
             endif()
         endif()
+        # The experimental RVV1024 kernel uses standard GCC RVV intrinsics, not
+        # proprietary SpacemiT instructions. Keep it separate from the IME switch.
+        if (GGML_CPU_RVV1024_FUSED)
+            if (NOT CMAKE_C_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+                message(FATAL_ERROR "GGML_CPU_RVV1024_FUSED requires GCC and G++")
+            endif()
+            if (NOT GGML_RVV OR GGML_XTHEADVECTOR)
+                message(FATAL_ERROR "GGML_CPU_RVV1024_FUSED requires standard RVV (GGML_RVV=ON)")
+            endif()
+            if (GGML_CPU_ALL_VARIANTS)
+                message(FATAL_ERROR "GGML_CPU_RVV1024_FUSED does not support GGML_CPU_ALL_VARIANTS yet")
+            endif()
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/spacemit/rvv1024_fused.cpp
+                ggml-cpu/spacemit/rvv1024_fused.h
+            )
+            message(STATUS "GGML: building GCC RVV1024 fused attention kernel skeleton")
+        endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
             set(MARCH_STR "rv64gc")
             if (GGML_RVV)
