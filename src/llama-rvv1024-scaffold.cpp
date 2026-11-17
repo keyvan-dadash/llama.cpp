@@ -98,9 +98,11 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
         return nullptr;
     }
 
-    // Narrow contract for the first structural experiment: Qwen2.5-Coder-1.5B,
-    // Q4_0 projections, FP16 K/V, one sequence, no adapters or extra transforms.
-    // Unsupported configurations must use the ordinary Qwen2 graph.
+    // The packed-weight loader is not wired up yet. In particular, the
+    // model's GGUF Q4_0 W_Q/W_O are NOT packed I8 column-SoA tensors.
+    // Until model-lifetime packed tensors are supplied, reject them and use
+    // the unmodified Qwen2 graph. Never pass row-major Q4_0 to the RVV kernel.
+    // K/V projection intentionally stays on GGML during this phase.
     if (n_embd != 1536 || n_head != 12 || n_head_kv != 2 ||
         n_embd_head_k != 128 || n_embd_head_v != 128 || n_rot != 128 ||
         n_tokens <= 1 || ubatch.n_seqs_unq != 1 || cparams.training ||
@@ -115,8 +117,9 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
         !inp || !inp->mctx || !inp->self_attn_mask.raw || inp->self_attn_mask.rows ||
         inp->mctx->type_k() != GGML_TYPE_F16 || inp->mctx->type_v() != GGML_TYPE_F16 ||
         !layer.wq || !layer.wk || !layer.wv || !layer.wo ||
-        layer.wq->type != GGML_TYPE_Q4_0 || layer.wk->type != GGML_TYPE_Q4_0 ||
-        layer.wv->type != GGML_TYPE_Q4_0 || layer.wo->type != GGML_TYPE_Q4_0 ||
+        layer.wq->type != GGML_TYPE_I8 || layer.wq->ne[0] != static_cast<int64_t>(spacemit_kernels::rvv::fused1024::Q_PACKED_BYTES) ||
+        layer.wo->type != GGML_TYPE_I8 || layer.wo->ne[0] != static_cast<int64_t>(spacemit_kernels::rvv::fused1024::WO_PACKED_BYTES) ||
+        layer.wk->type != GGML_TYPE_Q4_0 || layer.wv->type != GGML_TYPE_Q4_0 ||
         layer.wqkv || layer.wo_b || layer.wq_s || layer.wk_s || layer.wv_s || layer.wo_s ||
         (il < (int) inp->self_k_rot.size() && inp->self_k_rot[il]) ||
         (il < (int) inp->self_v_rot.size() && inp->self_v_rot[il])) {
@@ -161,8 +164,10 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     auto * k_cache = inp->mctx->get_k(ctx0, il);
     auto * v_cache = inp->mctx->get_v(ctx0, il);
 
-    // Inputs: X, Wq, Q bias, Wo, positions, K cache, V cache, causal
-    // mask, and the KV-ready dependency. 9 < GGML_MAX_SRC (10).
+    // Inputs: X, PACKED Wq, Q bias, PACKED Wo, positions, K cache, V cache,
+    // causal mask, and the KV-ready dependency. 9 < GGML_MAX_SRC (10).
+    // Future loader must supply graph-owned packed tensors at src[1]/src[3];
+    // the original model weight tensors cannot be reused as these arguments.
     // GGML graph metadata owns the two RoPE scalars until graph execution
     // finishes. Do not pass an address of local variables as custom userdata.
     using spacemit_kernels::rvv::fused1024::prefill_rope_config;
