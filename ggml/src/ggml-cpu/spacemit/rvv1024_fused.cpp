@@ -443,6 +443,12 @@ void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata) {
     }
     GGML_ASSERT(prefill_kernel_ready()); // checks THIS worker's RVV width
 #if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
+    if (ith == 0) {
+        fprintf(stderr,
+                "RVV1024 FUSED EXECUTING: tokens=%lld, threads=%d, vlenb=%zu\n",
+                (long long) parts->ne[1], nth,
+                (size_t) __riscv_vlenb());
+    }
     for (int group = ith; group < N_Q_GROUPS; group += nth) {
         // This processes all prompt tokens for three Q heads together:
         // ONE shared K/V traversal, three softmax states, direct partial W_O.

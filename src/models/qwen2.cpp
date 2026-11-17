@@ -1,6 +1,8 @@
 #include "models.h"
 #include "rvv1024_fused.h"
 
+#include <cstring>
+
 void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -17,8 +19,27 @@ void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
+void llama_model_qwen2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    // The single-GGUF repacker marks files that contain additional SoA tensors.
+    // Check the file format, NOT runtime head dimensions, before deciding which
+    // GGUF tensor entries the model loader must register.
+    const int rvv_key = gguf_find_key(ml.metadata, "rvv1024.layout");
+    const bool packed_rvv1024 = rvv_key >= 0;
+    if (packed_rvv1024) {
+        if (gguf_get_kv_type(ml.metadata, rvv_key) != GGUF_TYPE_STRING ||
+            std::strcmp(gguf_get_val_str(ml.metadata, rvv_key),
+                        "qwen2-q4_0-rvv1024-3head-colsoa-v1") != 0) {
+            throw std::runtime_error("unsupported rvv1024.layout in GGUF");
+        }
+        if (n_embd != 1536 || n_head != 12 || n_head_kv != 2 ||
+            n_embd_head_k != 128 || n_embd_head_v != 128 || n_layer != 28) {
+            throw std::runtime_error(
+                "RVV1024 packed GGUF requires Qwen2: 1536 hidden, 12 Q heads, "
+                "2 KV heads, 128 head dim and 28 layers");
+        }
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -39,17 +60,17 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
         create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
 
-        // These additional I8 tensors are opaque packed byte blobs in the same
-        // GGUF. Do not replace the original Q4_0 W_Q, W_K, W_V, or W_O.
-        if (n_embd == 1536 && n_head == 12 && n_head_kv == 2 &&
-            n_embd_head_k == 128 && n_embd_head_v == 128 && n_layer == 28) {
+        // Original Q4_0 tensors remain available for fallback/decoding.
+        // A packed GGUF MUST register ALL 3 additional byte tensors per layer.
+        // Required tensors fail at the missing name, not at a later count check.
+        if (packed_rvv1024) {
             namespace rv = spacemit_kernels::rvv::fused1024;
             layer.wq_rvv1024 = create_tensor(tn(LLM_TENSOR_ATTN_Q, "rvv1024", i),
-                {static_cast<int64_t>(rv::Q_PACKED_BYTES)}, TENSOR_NOT_REQUIRED);
+                {static_cast<int64_t>(rv::Q_PACKED_BYTES)}, 0);
             layer.wkv_rvv1024 = create_tensor(tn(LLM_TENSOR_ATTN_K, "rvv1024", i),
-                {static_cast<int64_t>(rv::KV_PACKED_BYTES)}, TENSOR_NOT_REQUIRED);
+                {static_cast<int64_t>(rv::KV_PACKED_BYTES)}, 0);
             layer.wo_rvv1024 = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "rvv1024", i),
-                {static_cast<int64_t>(rv::WO_PACKED_BYTES)}, TENSOR_NOT_REQUIRED);
+                {static_cast<int64_t>(rv::WO_PACKED_BYTES)}, 0);
         }
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
