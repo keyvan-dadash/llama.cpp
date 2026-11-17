@@ -99,7 +99,7 @@ bool prefill_kernel_ready() noexcept {
                 kc->ne[0] == HEAD_DIM && kc->ne[1] == N_KV_HEADS && kc->ne[3] == 1 &&
                 kc->nb[0] == 2 && vc->ne[3] == 1);
     const int64_t n_kv = kc->ne[2];
-    const bool v_trans = vc->ne[0] == n_kv && vc->ne[1] == N_KV_HEADS && vc->ne[2] == HEAD_DIM;
+    const bool v_trans = vc->nb[1] > vc->nb[2];
     GGML_ASSERT((v_trans || (vc->ne[0] == HEAD_DIM && vc->ne[1] == N_KV_HEADS && vc->ne[2] == n_kv)) &&
                 vc->nb[0] == 2 && n_kv > 0);
     GGML_ASSERT((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
