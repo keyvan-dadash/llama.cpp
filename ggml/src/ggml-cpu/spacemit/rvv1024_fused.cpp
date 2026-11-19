@@ -271,12 +271,21 @@ bool prefill_kernel_ready() noexcept {
         const float * bias = bq ? static_cast<const float *>(bq->data) + first_head * HEAD_DIM : nullptr;
         const auto zero = __riscv_vfmv_v_f_f32m2(0.0f, VL);
 
-        // Head-major Q projection limits live vector registers to four Q
-        // accumulators (two tokens x two halves) instead of twelve. These
-        // small FP32 scratch arrays avoid implicit spills during attention.
-        alignas(64) float q_first[Q_HEADS_TILE * HEAD_DIM];
-        alignas(64) float q_second[Q_HEADS_TILE * HEAD_DIM];
-        for (int head = 0; head < Q_HEADS_TILE; ++head) {
+        // Finish each head's two-token Q projection, apply per-token RoPE,
+        // and narrow immediately to FP16. No addressable Q scratch arrays.
+        // FP16 Q for both tokens remains live for the two attention passes.
+        const auto rope = [&](vfloat32m2_t & lo, vfloat32m2_t & hi,
+                              vfloat32m2_t cv, vfloat32m2_t sv) {
+            const vfloat32m2_t old = lo;
+            lo = __riscv_vfsub_vv_f32m2(__riscv_vfmul_vv_f32m2(old, cv, VL),
+                                         __riscv_vfmul_vv_f32m2(hi, sv, VL), VL);
+            hi = __riscv_vfadd_vv_f32m2(__riscv_vfmul_vv_f32m2(hi, cv, VL),
+                                         __riscv_vfmul_vv_f32m2(old, sv, VL), VL);
+        };
+
+        const auto project_head_pair = [&](int head,
+                                           vfloat16m1_t & t0_lo, vfloat16m1_t & t0_hi,
+                                           vfloat16m1_t & t1_lo, vfloat16m1_t & t1_hi) {
             const float * head_bias = bias ? bias + head * HEAD_DIM : nullptr;
             vfloat32m2_t q0_lo = head_bias ? __riscv_vle32_v_f32m2(head_bias, VL) : zero;
             vfloat32m2_t q0_hi = head_bias ? __riscv_vle32_v_f32m2(head_bias + 64, VL) : zero;
@@ -289,40 +298,26 @@ bool prefill_kernel_ready() noexcept {
                     shared1->x8[b].qs, shared1->x8[b].scale,
                     q0_lo, q0_hi, q1_lo, q1_hi);
             }
-            __riscv_vse32_v_f32m2(q_first  + head * HEAD_DIM,      q0_lo, VL);
-            __riscv_vse32_v_f32m2(q_first  + head * HEAD_DIM + 64, q0_hi, VL);
-            __riscv_vse32_v_f32m2(q_second + head * HEAD_DIM,      q1_lo, VL);
-            __riscv_vse32_v_f32m2(q_second + head * HEAD_DIM + 64, q1_hi, VL);
-        }
 
-        // Preserve the original per-token FP32 NEOX RoPE formula.
-        const auto rope = [&](vfloat32m2_t & lo, vfloat32m2_t & hi,
-                              vfloat32m2_t cv, vfloat32m2_t sv) {
-            const vfloat32m2_t old = lo;
-            lo = __riscv_vfsub_vv_f32m2(__riscv_vfmul_vv_f32m2(old, cv, VL),
-                                         __riscv_vfmul_vv_f32m2(hi, sv, VL), VL);
-            hi = __riscv_vfadd_vv_f32m2(__riscv_vfmul_vv_f32m2(hi, cv, VL),
-                                         __riscv_vfmul_vv_f32m2(old, sv, VL), VL);
+            // Preserve NEOX RoPE in FP32, then round Q to FP16 once.
+            const vfloat32m2_t cv0 = __riscv_vle32_v_f32m2(shared0->c, VL);
+            const vfloat32m2_t sv0 = __riscv_vle32_v_f32m2(shared0->s, VL);
+            rope(q0_lo, q0_hi, cv0, sv0);
+            t0_lo = __riscv_vfncvt_f_f_w_f16m1(q0_lo, VL);
+            t0_hi = __riscv_vfncvt_f_f_w_f16m1(q0_hi, VL);
+
+            const vfloat32m2_t cv1 = __riscv_vle32_v_f32m2(shared1->c, VL);
+            const vfloat32m2_t sv1 = __riscv_vle32_v_f32m2(shared1->s, VL);
+            rope(q1_lo, q1_hi, cv1, sv1);
+            t1_lo = __riscv_vfncvt_f_f_w_f16m1(q1_lo, VL);
+            t1_hi = __riscv_vfncvt_f_f_w_f16m1(q1_hi, VL);
         };
 
-        vfloat32m2_t q00 = __riscv_vle32_v_f32m2(q_first +   0, VL);
-        vfloat32m2_t q01 = __riscv_vle32_v_f32m2(q_first +  64, VL);
-        vfloat32m2_t q10 = __riscv_vle32_v_f32m2(q_first + 128, VL);
-        vfloat32m2_t q11 = __riscv_vle32_v_f32m2(q_first + 192, VL);
-        vfloat32m2_t q20 = __riscv_vle32_v_f32m2(q_first + 256, VL);
-        vfloat32m2_t q21 = __riscv_vle32_v_f32m2(q_first + 320, VL);
-        const vfloat32m2_t cv0 = __riscv_vle32_v_f32m2(shared0->c, VL);
-        const vfloat32m2_t sv0 = __riscv_vle32_v_f32m2(shared0->s, VL);
-        rope(q00, q01, cv0, sv0);
-        rope(q10, q11, cv0, sv0);
-        rope(q20, q21, cv0, sv0);
-        // Round rotated Q to FP16 once; attention uses F16 x F16 -> F32.
-        const vfloat16m1_t qh00 = __riscv_vfncvt_f_f_w_f16m1(q00, VL);
-        const vfloat16m1_t qh01 = __riscv_vfncvt_f_f_w_f16m1(q01, VL);
-        const vfloat16m1_t qh10 = __riscv_vfncvt_f_f_w_f16m1(q10, VL);
-        const vfloat16m1_t qh11 = __riscv_vfncvt_f_f_w_f16m1(q11, VL);
-        const vfloat16m1_t qh20 = __riscv_vfncvt_f_f_w_f16m1(q20, VL);
-        const vfloat16m1_t qh21 = __riscv_vfncvt_f_f_w_f16m1(q21, VL);
+        vfloat16m1_t qh00, qh01, qh10, qh11, qh20, qh21;
+        vfloat16m1_t qh00_second, qh01_second, qh10_second, qh11_second, qh20_second, qh21_second;
+        project_head_pair(0, qh00, qh01, qh00_second, qh01_second);
+        project_head_pair(1, qh10, qh11, qh10_second, qh11_second);
+        project_head_pair(2, qh20, qh21, qh20_second, qh21_second);
 
         // First token: keep the existing attention, online softmax and W_O.
         const int64_t token = token_pair;
@@ -443,24 +438,13 @@ bool prefill_kernel_ready() noexcept {
         // coefficients and cached Q projection. No two-iteration token loop.
         if (has_second) {
             const int64_t token = token_pair + 1;
-            vfloat32m2_t q00 = __riscv_vle32_v_f32m2(q_second +   0, VL);
-            vfloat32m2_t q01 = __riscv_vle32_v_f32m2(q_second +  64, VL);
-            vfloat32m2_t q10 = __riscv_vle32_v_f32m2(q_second + 128, VL);
-            vfloat32m2_t q11 = __riscv_vle32_v_f32m2(q_second + 192, VL);
-            vfloat32m2_t q20 = __riscv_vle32_v_f32m2(q_second + 256, VL);
-            vfloat32m2_t q21 = __riscv_vle32_v_f32m2(q_second + 320, VL);
-            const vfloat32m2_t cv1 = __riscv_vle32_v_f32m2(shared1->c, VL);
-            const vfloat32m2_t sv1 = __riscv_vle32_v_f32m2(shared1->s, VL);
-            rope(q00, q01, cv1, sv1);
-            rope(q10, q11, cv1, sv1);
-            rope(q20, q21, cv1, sv1);
-            // Round rotated Q to FP16 once; attention uses F16 x F16 -> F32.
-            const vfloat16m1_t qh00 = __riscv_vfncvt_f_f_w_f16m1(q00, VL);
-            const vfloat16m1_t qh01 = __riscv_vfncvt_f_f_w_f16m1(q01, VL);
-            const vfloat16m1_t qh10 = __riscv_vfncvt_f_f_w_f16m1(q10, VL);
-            const vfloat16m1_t qh11 = __riscv_vfncvt_f_f_w_f16m1(q11, VL);
-            const vfloat16m1_t qh20 = __riscv_vfncvt_f_f_w_f16m1(q20, VL);
-            const vfloat16m1_t qh21 = __riscv_vfncvt_f_f_w_f16m1(q21, VL);
+            // Use token 2's Q vectors prepared above; no Q loads or RoPE here.
+            const vfloat16m1_t qh00 = qh00_second;
+            const vfloat16m1_t qh01 = qh01_second;
+            const vfloat16m1_t qh10 = qh10_second;
+            const vfloat16m1_t qh11 = qh11_second;
+            const vfloat16m1_t qh20 = qh20_second;
+            const vfloat16m1_t qh21 = qh21_second;
             // Online streaming softmax for THREE heads over ONE shared KV pass.
             // No per-head KV traversal, and no Q/O tensor materialization.
             float m0 = -__builtin_inff(), m1 = -__builtin_inff(), m2 = -__builtin_inff();
