@@ -64,7 +64,7 @@ bool prefill_kernel_ready() noexcept {
 // prefix+t+1, determines which KV-cache slots are visible to each token.
 #if defined(__riscv_v) && defined(__riscv_v_intrinsic)
 [[maybe_unused]] static void fused_three_head_prefill_group(
-        ggml_tensor * parts, int group, float rope_base, float rope_freq_scale) {
+        ggml_tensor * parts, int group) {
     constexpr size_t VL = 64;     // 64 FP32 lanes in m2 at VLEN=1024
     constexpr size_t WO_VL = WO_SUBTILE_OUTPUTS / 2; // 128 FP32 lanes in m4
     constexpr size_t QK = Q4_BLOCK_SIZE;
@@ -74,22 +74,20 @@ bool prefill_kernel_ready() noexcept {
     GGML_ASSERT(parts && parts->data && group >= 0 && group < N_Q_GROUPS);
     GGML_ASSERT(ggml_is_contiguous(parts) && parts->type == GGML_TYPE_F32 &&
                 parts->ne[0] == HIDDEN_DIM && parts->ne[2] == N_Q_GROUPS);
-    GGML_ASSERT(rope_base > 0.0f && rope_freq_scale > 0.0f);
     GGML_ASSERT(hardware_vlen_supported());
 
     // Sources match src/llama-rvv1024-scaffold.cpp's custom_4d args[].
-    const ggml_tensor * x   = parts->src[0];  // normed input [1536, ntok]
+    const ggml_tensor * prepared = parts->src[0]; // I8 prepared X/RoPE [2240, ntok]
     const ggml_tensor * wq  = parts->src[1];  // packed I8 [Q_PACKED_BYTES]
     const ggml_tensor * bq  = parts->src[2];  // optional Q bias [1536]
     const ggml_tensor * wo  = parts->src[3];  // packed I8 [WO_PACKED_BYTES]
-    const ggml_tensor * pos = parts->src[4];  // I32 token positions
-    const ggml_tensor * kc  = parts->src[5];  // FP16 [128, 2, n_kv, 1]
-    const ggml_tensor * vc  = parts->src[6];  // FP16 normal or V-transposed
-    const ggml_tensor * mask= parts->src[7];  // F16/F32 [n_kv, ntok, 1, 1]
-    GGML_ASSERT(x && wq && wo && pos && kc && vc && mask);
-    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[0] == HIDDEN_DIM && x->nb[0] == 4 &&
-                x->ne[1] == parts->ne[1]);
-    GGML_ASSERT(pos->type == GGML_TYPE_I32 && pos->ne[0] >= x->ne[1] && pos->nb[0] == 4);
+    const ggml_tensor * kc  = parts->src[4];  // FP16 [128, 2, n_kv, 1]
+    const ggml_tensor * vc  = parts->src[5];  // FP16 normal or V-transposed
+    const ggml_tensor * mask= parts->src[6];  // F16/F32 [n_kv, ntok, 1, 1]
+    GGML_ASSERT(prepared && wq && wo && kc && vc && mask);
+    GGML_ASSERT(prepared->type == GGML_TYPE_I8 && ggml_is_contiguous(prepared) &&
+                prepared->ne[0] == static_cast<int64_t>(sizeof(prefill_prepared_token)) &&
+                prepared->ne[1] == parts->ne[1] && prepared->nb[0] == 1);
     // Packed blobs are byte-addressable tensors with exact ABI size.
     // Never reinterpret an ordinary GGML Q4_0 weight matrix as column-SoA.
     GGML_ASSERT(wq->type == GGML_TYPE_I8 && wo->type == GGML_TYPE_I8 &&
@@ -109,7 +107,7 @@ bool prefill_kernel_ready() noexcept {
                  (!v_trans && vc->ne[0] == HEAD_DIM && vc->ne[1] == N_KV_HEADS && vc->ne[2] == n_kv)) &&
                 vc->nb[0] == 2 && n_kv > 0);
     GGML_ASSERT((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
-                mask->ne[0] >= n_kv && mask->ne[1] >= x->ne[1] &&
+                mask->ne[0] >= n_kv && mask->ne[1] >= prepared->ne[1] &&
                 mask->nb[0] == (mask->type == GGML_TYPE_F16 ? 2u : 4u));
 
     const int first_head = static_cast<int>(group_first_q_head(group));
@@ -244,40 +242,14 @@ bool prefill_kernel_ready() noexcept {
             __riscv_vncvt_x_x_w_i16m1(q, QK), QK);
     };
 
-    // Input quantization and RoPE coefficients are temporary per-token data.
-    // There is no addressable Q[3,128] or O[3,128] tensor in this function.
-    struct InputBlock { int8_t qs[32]; float scale; };
-    InputBlock x8[Q_BLOCKS];
-    float c[64], s[64];
-
-    for (int64_t token = 0; token < x->ne[1]; ++token) {
-        const float * xv = reinterpret_cast<const float *>(
-            static_cast<const uint8_t *>(x->data) + token * x->nb[1]);
-        for (int block = 0; block < Q_BLOCKS; ++block) {
-            float maximum = 0.0f;
-            for (int k = 0; k < static_cast<int>(QK); ++k) {
-                const float v = __builtin_fabsf(xv[block*QK + k]);
-                if (v > maximum) maximum = v;
-            }
-            const float scale = maximum / 127.0f;
-            const float inverse = scale == 0.0f ? 0.0f : 1.0f/scale;
-            x8[block].scale = ggml_fp16_to_fp32(ggml_fp32_to_fp16(scale));
-            for (int k = 0; k < static_cast<int>(QK); ++k) {
-                int q = static_cast<int>(__builtin_nearbyintf(xv[block*QK + k] * inverse));
-                if (q > 127) q = 127;
-                if (q < -127) q = -127;
-                x8[block].qs[k] = static_cast<int8_t>(q);
-            }
-        }
-
-        const int32_t position = *reinterpret_cast<const int32_t *>(
-            static_cast<const uint8_t *>(pos->data) + token * pos->nb[0]);
-        for (int i = 0; i < 64; ++i) {
-            const float theta = static_cast<float>(position) *
-                __builtin_powf(rope_base, -static_cast<float>(i) / 64.0f) * rope_freq_scale;
-            c[i] = __builtin_cosf(theta);
-            s[i] = __builtin_sinf(theta);
-        }
+    // Each token was prepared ONCE by the preceding graph node; the four
+    // groups read the same Q8 blocks and RoPE coefficients without races.
+    for (int64_t token = 0; token < prepared->ne[1]; ++token) {
+        const auto * shared = reinterpret_cast<const prefill_prepared_token *>(
+            static_cast<const uint8_t *>(prepared->data) + token * prepared->nb[1]);
+        const prefill_input_block * x8 = shared->x8;
+        const float * c = shared->c;
+        const float * s = shared->s;
 
         // Six 64-lane FP32 RVV values are exactly three complete Q heads.
         const float * bias = bq ? static_cast<const float *>(bq->data) + first_head * HEAD_DIM : nullptr;
@@ -426,14 +398,8 @@ void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata) {
                 parts->type == GGML_TYPE_F32 && ggml_is_contiguous(parts) &&
                 parts->ne[0] == HIDDEN_DIM && parts->ne[1] > 1 &&
                 parts->ne[2] == N_Q_GROUPS && parts->ne[3] == 1);
-    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth && userdata);
-
-    // The GGML custom callback forwards a pointer to the config bytes stored
-    // in a graph-owned tensor's op_params. Copy to avoid aliasing assumptions.
-    prefill_rope_config rope;
-    std::memcpy(&rope, userdata, sizeof(rope));
-    GGML_ASSERT(std::isfinite(rope.base) && rope.base > 0.0f &&
-                std::isfinite(rope.freq_scale) && rope.freq_scale > 0.0f);
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
+    (void) userdata; // RoPE parameters are consumed by the preparation node.
 
     // GGML invokes each node on its prefill threadpool. Every active worker
     // owns entire three-head groups, never individual heads. No concurrent
@@ -452,7 +418,7 @@ void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata) {
     for (int group = ith; group < N_Q_GROUPS; group += nth) {
         // This processes all prompt tokens for three Q heads together:
         // ONE shared K/V traversal, three softmax states, direct partial W_O.
-        fused_three_head_prefill_group(parts, group, rope.base, rope.freq_scale);
+        fused_three_head_prefill_group(parts, group);
     }
 #else
     GGML_ABORT("RVV1024: fused prefill requires 1024-bit RVV with Zvfh");

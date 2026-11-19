@@ -60,6 +60,61 @@ static void rvv1024_kv_ready_fn(ggml_tensor * dst, int ith, int nth, void * user
     }
 }
 
+// Quantize each normalized input token and calculate its RoPE coefficients
+// ONCE, before the four Q-head group workers read them. Separate graph nodes
+// provide the necessary execution-order barrier without spin synchronization.
+static void rvv1024_prepare_x_rope_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    using namespace spacemit_kernels::rvv::fused1024;
+
+    GGML_ASSERT(dst && dst->data && userdata && nth > 0 && ith >= 0 && ith < nth);
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * pos = dst->src[1];
+    GGML_ASSERT(x && x->data && pos && pos->data);
+    GGML_ASSERT(dst->type == GGML_TYPE_I8 && ggml_is_contiguous(dst) &&
+                dst->ne[0] == static_cast<int64_t>(sizeof(prefill_prepared_token)) &&
+                dst->ne[1] == x->ne[1] && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[0] == HIDDEN_DIM && x->nb[0] == 4);
+    GGML_ASSERT(pos->type == GGML_TYPE_I32 && pos->ne[0] >= x->ne[1] && pos->nb[0] == 4);
+
+    prefill_rope_config rope;
+    std::memcpy(&rope, userdata, sizeof(rope));
+    GGML_ASSERT(std::isfinite(rope.base) && rope.base > 0.0f &&
+                std::isfinite(rope.freq_scale) && rope.freq_scale > 0.0f);
+
+    for (int64_t token = ith; token < x->ne[1]; token += nth) {
+        auto * prepared = reinterpret_cast<prefill_prepared_token *>(
+            static_cast<uint8_t *>(dst->data) + token * dst->nb[1]);
+        const float * xv = reinterpret_cast<const float *>(
+            static_cast<const uint8_t *>(x->data) + token * x->nb[1]);
+
+        for (int block = 0; block < Q_BLOCKS_PER_ROW; ++block) {
+            float maximum = 0.0f;
+            for (int k = 0; k < Q4_BLOCK_SIZE; ++k) {
+                const float v = __builtin_fabsf(xv[block * Q4_BLOCK_SIZE + k]);
+                if (v > maximum) maximum = v;
+            }
+            const float scale = maximum / 127.0f;
+            const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+            prepared->x8[block].scale = ggml_fp16_to_fp32(ggml_fp32_to_fp16(scale));
+            for (int k = 0; k < Q4_BLOCK_SIZE; ++k) {
+                int q = static_cast<int>(__builtin_nearbyintf(xv[block * Q4_BLOCK_SIZE + k] * inverse));
+                if (q > 127) q = 127;
+                if (q < -127) q = -127;
+                prepared->x8[block].qs[k] = static_cast<int8_t>(q);
+            }
+        }
+
+        const int32_t position = *reinterpret_cast<const int32_t *>(
+            static_cast<const uint8_t *>(pos->data) + token * pos->nb[0]);
+        for (int i = 0; i < HEAD_DIM / 2; ++i) {
+            const float theta = static_cast<float>(position) *
+                __builtin_powf(rope.base, -static_cast<float>(i) / 64.0f) * rope.freq_scale;
+            prepared->c[i] = __builtin_cosf(theta);
+            prepared->s[i] = __builtin_sinf(theta);
+        }
+    }
+}
+
 static void rvv1024_q_attn_wo_fn(ggml_tensor * parts, int ith, int nth, void * userdata) {
     const auto reg = rvv1024_cpu_reg();
     const auto forward = reg ? reinterpret_cast<spacemit_kernels::rvv::fused1024::prefill_forward_fn>(
@@ -164,18 +219,29 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     auto * k_cache = inp->mctx->get_k(ctx0, il);
     auto * v_cache = inp->mctx->get_v(ctx0, il);
 
-    // Inputs: X, PACKED Wq, Q bias, PACKED Wo, positions, K cache, V cache,
-    // causal mask, and the KV-ready dependency. 9 < GGML_MAX_SRC (10).
-    // Source [1] and [3] are packed GGUF tensors, not regular Q4_0.
-    // GGML graph metadata owns the two RoPE scalars until graph execution
-    // finishes. Do not pass an address of local variables as custom userdata.
+    // Graph-lifetime storage for the two RoPE scalars. Only the preparation
+    // node consumes these parameters; all four fused workers read its output.
     using spacemit_kernels::rvv::fused1024::prefill_rope_config;
+    using spacemit_kernels::rvv::fused1024::prefill_prepared_token;
     const prefill_rope_config rope_cfg = { freq_base, freq_scale };
     ggml_tensor * rope_params = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 2);
     static_assert(sizeof(rope_cfg) <= sizeof(rope_params->op_params), "RoPE config too large");
     std::memcpy(rope_params->op_params, &rope_cfg, sizeof(rope_cfg));
+
+    // The output is [2240 bytes per token, n_tokens]. Each token is written
+    // by exactly one worker; the fused node executes only after this node.
+    ggml_tensor * prepare_args[] = { x_norm, inp_pos };
+    ggml_tensor * prepared = ggml_custom_4d(
+            ctx0, GGML_TYPE_I8, sizeof(prefill_prepared_token), n_tokens, 1, 1,
+            prepare_args, 2, rvv1024_prepare_x_rope_fn, GGML_N_TASKS_MAX,
+            rope_params->op_params);
+    ggml_set_name(prepared, "rvv1024_prepared_x_rope");
+
+    // Inputs: shared prepared X/RoPE, packed Wq, Q bias, packed Wo,
+    // K cache, V cache, causal mask, KV-ready dependency (8 sources).
+    // Source [1] and [3] are packed GGUF tensors, not regular Q4_0.
     ggml_tensor * args[] = {
-        x_norm, layer.wq_rvv1024, layer.wq_b, layer.wo_rvv1024, inp_pos,
+        prepared, layer.wq_rvv1024, layer.wq_b, layer.wo_rvv1024,
         k_cache, v_cache, inp->self_attn_mask.raw, kv_ready,
     };
     // [hidden, tokens, group, 1]. Each three-head group owns one nonoverlapping
@@ -183,7 +249,7 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     ggml_tensor * parts = ggml_custom_4d(
             ctx0, GGML_TYPE_F32, n_embd, n_tokens,
             spacemit_kernels::rvv::fused1024::N_Q_GROUPS, 1,
-            args, 9, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, rope_params->op_params);
+            args, 8, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, nullptr);
     ggml_set_name(parts, "rvv1024_partial_y");
 
     // A separate graph node runs after all per-group workers have finished.

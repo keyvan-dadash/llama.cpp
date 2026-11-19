@@ -64,6 +64,21 @@ static_assert(Q_BLOCK_BYTES == 7680 && Q_GROUP_BYTES == 368640 &&
               Q_PACKED_BYTES == 1474560 && WO_PACKED_BYTES == 1474560,
               "RVV1024 packed-weight ABI mismatch");
 
+// Per-token, read-only preparation shared by all four Q-head groups.
+// Produced by a separate GGML custom node, before fused Q/attention/W_O.
+// Keep the original Q8 rounding/scaling and NEOX RoPE coefficients intact.
+struct prefill_input_block {
+    int8_t qs[Q4_BLOCK_SIZE];
+    float scale;
+};
+struct prefill_prepared_token {
+    prefill_input_block x8[Q_BLOCKS_PER_ROW];
+    float c[HEAD_DIM / 2];
+    float s[HEAD_DIM / 2];
+};
+static_assert(sizeof(prefill_input_block) == 36 && sizeof(prefill_prepared_token) == 2240,
+              "RVV1024 prefill preparation ABI mismatch");
+
 
 // Workers own disjoint [hidden, tokens] slabs of the [hidden, tokens, group]
 // partial tensor. Group g covers Q heads [3*g, 3*g+3); its KV head is g/2.
