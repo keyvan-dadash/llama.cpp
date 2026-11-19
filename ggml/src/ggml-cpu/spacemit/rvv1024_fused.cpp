@@ -119,40 +119,55 @@ bool prefill_kernel_ready() noexcept {
     // One 32-input block, ONE head (128 outputs). Per input column a single
     // contiguous e8mf2 load (64 bytes) supplies both output halves via its
     // low/high nibbles. Three calls cover the 384 outputs of the Q group.
-    // Processing heads sequentially reduces live integer temporaries while
-    // retaining all six 64-lane FP32 Q accumulators across input blocks.
+    // Processing one head at a time keeps only four Q accumulators live
+    // across input blocks: two halves for each of the two tokens.
+    // Two-token Q4_0 x Q8 microkernel: each 64-byte packed weight vector
+    // is loaded and unpacked once, then used for both token accumulators.
     const auto q_head_block = [&](const uint8_t * packed_block, int head,
-                                  const int8_t * input_q8, float input_scale,
-                                  vfloat32m2_t & q_lo, vfloat32m2_t & q_hi) {
-        vint32m2_t s_lo = __riscv_vmv_v_x_i32m2(0, VL);
-        vint32m2_t s_hi = __riscv_vmv_v_x_i32m2(0, VL);
+                                  const int8_t * input0_q8, float input0_scale,
+                                  const int8_t * input1_q8, float input1_scale,
+                                  vfloat32m2_t & q0_lo, vfloat32m2_t & q0_hi,
+                                  vfloat32m2_t & q1_lo, vfloat32m2_t & q1_hi) {
+        vint32m2_t s0_lo = __riscv_vmv_v_x_i32m2(0, VL);
+        vint32m2_t s0_hi = __riscv_vmv_v_x_i32m2(0, VL);
+        vint32m2_t s1_lo = __riscv_vmv_v_x_i32m2(0, VL);
+        vint32m2_t s1_hi = __riscv_vmv_v_x_i32m2(0, VL);
         for (int k = 0; k < static_cast<int>(QK); ++k) {
-            const int16_t xk = input_q8[k];
             const uint8_t * col = packed_block + k * Q_COL_BYTES + head * (HEAD_DIM / 2);
             const vuint8mf2_t packed = __riscv_vle8_v_u8mf2(col, VL);
             const vuint8mf2_t lowbits = __riscv_vsub_vx_u8mf2(
                 __riscv_vand_vx_u8mf2(packed, 15, VL), 8, VL);
             const vuint8mf2_t highbits = __riscv_vsub_vx_u8mf2(
                 __riscv_vsrl_vx_u8mf2(packed, 4, VL), 8, VL);
-            s_lo = __riscv_vwmacc_vx_i32m2(s_lo, xk,
-                __riscv_vsext_vf2_i16m1(
-                    __riscv_vreinterpret_v_u8mf2_i8mf2(lowbits), VL), VL);
-            s_hi = __riscv_vwmacc_vx_i32m2(s_hi, xk,
-                __riscv_vsext_vf2_i16m1(
-                    __riscv_vreinterpret_v_u8mf2_i8mf2(highbits), VL), VL);
+            const vint16m1_t lo16 = __riscv_vsext_vf2_i16m1(
+                __riscv_vreinterpret_v_u8mf2_i8mf2(lowbits), VL);
+            const vint16m1_t hi16 = __riscv_vsext_vf2_i16m1(
+                __riscv_vreinterpret_v_u8mf2_i8mf2(highbits), VL);
+            s0_lo = __riscv_vwmacc_vx_i32m2(s0_lo, static_cast<int16_t>(input0_q8[k]), lo16, VL);
+            s0_hi = __riscv_vwmacc_vx_i32m2(s0_hi, static_cast<int16_t>(input0_q8[k]), hi16, VL);
+            s1_lo = __riscv_vwmacc_vx_i32m2(s1_lo, static_cast<int16_t>(input1_q8[k]), lo16, VL);
+            s1_hi = __riscv_vwmacc_vx_i32m2(s1_hi, static_cast<int16_t>(input1_q8[k]), hi16, VL);
         }
         const float * scales = reinterpret_cast<const float *>(
             packed_block + QK * Q_COL_BYTES) + head * HEAD_DIM;
-        q_lo = __riscv_vfadd_vv_f32m2(q_lo,
+        const vfloat32m2_t scale_lo = __riscv_vle32_v_f32m2(scales, VL);
+        const vfloat32m2_t scale_hi = __riscv_vle32_v_f32m2(scales + 64, VL);
+        q0_lo = __riscv_vfadd_vv_f32m2(q0_lo,
             __riscv_vfmul_vf_f32m2(
-                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s_lo, VL),
-                                        __riscv_vle32_v_f32m2(scales, VL), VL),
-                input_scale, VL), VL);
-        q_hi = __riscv_vfadd_vv_f32m2(q_hi,
+                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s0_lo, VL), scale_lo, VL),
+                input0_scale, VL), VL);
+        q0_hi = __riscv_vfadd_vv_f32m2(q0_hi,
             __riscv_vfmul_vf_f32m2(
-                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s_hi, VL),
-                                        __riscv_vle32_v_f32m2(scales + 64, VL), VL),
-                input_scale, VL), VL);
+                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s0_hi, VL), scale_hi, VL),
+                input0_scale, VL), VL);
+        q1_lo = __riscv_vfadd_vv_f32m2(q1_lo,
+            __riscv_vfmul_vf_f32m2(
+                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s1_lo, VL), scale_lo, VL),
+                input1_scale, VL), VL);
+        q1_hi = __riscv_vfadd_vv_f32m2(q1_hi,
+            __riscv_vfmul_vf_f32m2(
+                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s1_hi, VL), scale_hi, VL),
+                input1_scale, VL), VL);
     };
 
     // Small inline W_O microkernel. Keeping this inside the fused function
@@ -242,42 +257,75 @@ bool prefill_kernel_ready() noexcept {
             __riscv_vncvt_x_x_w_i16m1(q, QK), QK);
     };
 
-    // Each token was prepared ONCE by the preceding graph node; the four
-    // groups read the same Q8 blocks and RoPE coefficients without races.
-    for (int64_t token = 0; token < prepared->ne[1]; ++token) {
-        const auto * shared = reinterpret_cast<const prefill_prepared_token *>(
-            static_cast<const uint8_t *>(prepared->data) + token * prepared->nb[1]);
-        const prefill_input_block * x8 = shared->x8;
-        const float * c = shared->c;
-        const float * s = shared->s;
-
-        // Six 64-lane FP32 RVV values are exactly three complete Q heads.
+    // One pair at a time. The separate graph node already quantized both
+    // inputs and prepared both sets of NEOX RoPE coefficients.
+    for (int64_t token_pair = 0; token_pair < prepared->ne[1]; token_pair += 2) {
+        const auto * shared0 = reinterpret_cast<const prefill_prepared_token *>(
+            static_cast<const uint8_t *>(prepared->data) + token_pair * prepared->nb[1]);
+        const bool has_second = token_pair + 1 < prepared->ne[1];
+        // For an odd final token, reuse the first input in the unused second
+        // accumulator. We never execute attention/W_O for that dummy token.
+        const auto * shared1 = has_second ?
+            reinterpret_cast<const prefill_prepared_token *>(
+                static_cast<const uint8_t *>(prepared->data) + (token_pair + 1) * prepared->nb[1]) : shared0;
         const float * bias = bq ? static_cast<const float *>(bq->data) + first_head * HEAD_DIM : nullptr;
         const auto zero = __riscv_vfmv_v_f_f32m2(0.0f, VL);
-        vfloat32m2_t q00 = bias ? __riscv_vle32_v_f32m2(bias +   0, VL) : zero;
-        vfloat32m2_t q01 = bias ? __riscv_vle32_v_f32m2(bias +  64, VL) : zero;
-        vfloat32m2_t q10 = bias ? __riscv_vle32_v_f32m2(bias + 128, VL) : zero;
-        vfloat32m2_t q11 = bias ? __riscv_vle32_v_f32m2(bias + 192, VL) : zero;
-        vfloat32m2_t q20 = bias ? __riscv_vle32_v_f32m2(bias + 256, VL) : zero;
-        vfloat32m2_t q21 = bias ? __riscv_vle32_v_f32m2(bias + 320, VL) : zero;
-        for (int b = 0; b < Q_BLOCKS; ++b) {
-            const uint8_t * block = q_tile + static_cast<size_t>(b) * Q_BLOCK_BYTES;
-            q_head_block(block, 0, x8[b].qs, x8[b].scale, q00, q01);
-            q_head_block(block, 1, x8[b].qs, x8[b].scale, q10, q11);
-            q_head_block(block, 2, x8[b].qs, x8[b].scale, q20, q21);
+
+        // Head-major Q projection limits live vector registers to four Q
+        // accumulators (two tokens x two halves) instead of twelve. These
+        // small FP32 scratch arrays avoid implicit spills during attention.
+        alignas(64) float q_first[Q_HEADS_TILE * HEAD_DIM];
+        alignas(64) float q_second[Q_HEADS_TILE * HEAD_DIM];
+        for (int head = 0; head < Q_HEADS_TILE; ++head) {
+            const float * head_bias = bias ? bias + head * HEAD_DIM : nullptr;
+            vfloat32m2_t q0_lo = head_bias ? __riscv_vle32_v_f32m2(head_bias, VL) : zero;
+            vfloat32m2_t q0_hi = head_bias ? __riscv_vle32_v_f32m2(head_bias + 64, VL) : zero;
+            vfloat32m2_t q1_lo = q0_lo;
+            vfloat32m2_t q1_hi = q0_hi;
+            for (int b = 0; b < Q_BLOCKS; ++b) {
+                const uint8_t * block = q_tile + static_cast<size_t>(b) * Q_BLOCK_BYTES;
+                q_head_block(block, head,
+                    shared0->x8[b].qs, shared0->x8[b].scale,
+                    shared1->x8[b].qs, shared1->x8[b].scale,
+                    q0_lo, q0_hi, q1_lo, q1_hi);
+            }
+            __riscv_vse32_v_f32m2(q_first  + head * HEAD_DIM,      q0_lo, VL);
+            __riscv_vse32_v_f32m2(q_first  + head * HEAD_DIM + 64, q0_hi, VL);
+            __riscv_vse32_v_f32m2(q_second + head * HEAD_DIM,      q1_lo, VL);
+            __riscv_vse32_v_f32m2(q_second + head * HEAD_DIM + 64, q1_hi, VL);
         }
 
-        // Qwen2 NEOX rotate-half RoPE: [first 64] rotate with [last 64].
-        const vfloat32m2_t cv = __riscv_vle32_v_f32m2(c, VL);
-        const vfloat32m2_t sv = __riscv_vle32_v_f32m2(s, VL);
-        const auto rope = [&](vfloat32m2_t & lo, vfloat32m2_t & hi) {
+        // Preserve the original per-token FP32 NEOX RoPE formula.
+        const auto rope = [&](vfloat32m2_t & lo, vfloat32m2_t & hi,
+                              vfloat32m2_t cv, vfloat32m2_t sv) {
             const vfloat32m2_t old = lo;
             lo = __riscv_vfsub_vv_f32m2(__riscv_vfmul_vv_f32m2(old, cv, VL),
                                          __riscv_vfmul_vv_f32m2(hi, sv, VL), VL);
             hi = __riscv_vfadd_vv_f32m2(__riscv_vfmul_vv_f32m2(hi, cv, VL),
                                          __riscv_vfmul_vv_f32m2(old, sv, VL), VL);
         };
-        rope(q00, q01); rope(q10, q11); rope(q20, q21);
+
+        vfloat32m2_t q00 = __riscv_vle32_v_f32m2(q_first +   0, VL);
+        vfloat32m2_t q01 = __riscv_vle32_v_f32m2(q_first +  64, VL);
+        vfloat32m2_t q10 = __riscv_vle32_v_f32m2(q_first + 128, VL);
+        vfloat32m2_t q11 = __riscv_vle32_v_f32m2(q_first + 192, VL);
+        vfloat32m2_t q20 = __riscv_vle32_v_f32m2(q_first + 256, VL);
+        vfloat32m2_t q21 = __riscv_vle32_v_f32m2(q_first + 320, VL);
+        const vfloat32m2_t cv0 = __riscv_vle32_v_f32m2(shared0->c, VL);
+        const vfloat32m2_t sv0 = __riscv_vle32_v_f32m2(shared0->s, VL);
+        rope(q00, q01, cv0, sv0);
+        rope(q10, q11, cv0, sv0);
+        rope(q20, q21, cv0, sv0);
+        // Round rotated Q to FP16 once; attention uses F16 x F16 -> F32.
+        const vfloat16m1_t qh00 = __riscv_vfncvt_f_f_w_f16m1(q00, VL);
+        const vfloat16m1_t qh01 = __riscv_vfncvt_f_f_w_f16m1(q01, VL);
+        const vfloat16m1_t qh10 = __riscv_vfncvt_f_f_w_f16m1(q10, VL);
+        const vfloat16m1_t qh11 = __riscv_vfncvt_f_f_w_f16m1(q11, VL);
+        const vfloat16m1_t qh20 = __riscv_vfncvt_f_f_w_f16m1(q20, VL);
+        const vfloat16m1_t qh21 = __riscv_vfncvt_f_f_w_f16m1(q21, VL);
+
+        // First token: keep the existing attention, online softmax and W_O.
+        const int64_t token = token_pair;
 
         // Online streaming softmax for THREE heads over ONE shared KV pass.
         // No per-head KV traversal, and no Q/O tensor materialization.
@@ -301,17 +349,19 @@ bool prefill_kernel_ready() noexcept {
 
             const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
                                  kv * kc->nb[2] + kv_head * kc->nb[1];
-            const vfloat32m2_t k0 = f16_load64(kp, 2);
-            const vfloat32m2_t k1 = f16_load64(kp + 64*kc->nb[0], 2);
-            const auto score = [&](vfloat32m2_t low, vfloat32m2_t high) -> float {
-                const vfloat32m2_t products = __riscv_vfadd_vv_f32m2(
-                    __riscv_vfmul_vv_f32m2(low, k0, VL),
-                    __riscv_vfmul_vv_f32m2(high, k1, VL), VL);
+            // K stays in FP16. Widening FP16 MAC keeps the dot-product in FP32.
+            const vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
+                __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
+            const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
+                __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
+            const auto score = [&](vfloat16m1_t low, vfloat16m1_t high) -> float {
+                const vfloat32m2_t products = __riscv_vfwmacc_vv_f32m2(
+                    __riscv_vfwmul_vv_f32m2(low, k0, VL), high, k1, VL);
                 return sum64(products) * ATTN_SCALE + mask_score;
             };
-            const float s0 = score(q00, q01);
-            const float s1 = score(q10, q11);
-            const float s2 = score(q20, q21);
+            const float s0 = score(qh00, qh01);
+            const float s1 = score(qh10, qh11);
+            const float s2 = score(qh20, qh21);
 
             const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
                 (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
@@ -389,6 +439,142 @@ bool prefill_kernel_ready() noexcept {
                                         accum, WO_VL);
             }
         }
+        // Second token: the same attention and W_O, but with its own RoPE
+        // coefficients and cached Q projection. No two-iteration token loop.
+        if (has_second) {
+            const int64_t token = token_pair + 1;
+            vfloat32m2_t q00 = __riscv_vle32_v_f32m2(q_second +   0, VL);
+            vfloat32m2_t q01 = __riscv_vle32_v_f32m2(q_second +  64, VL);
+            vfloat32m2_t q10 = __riscv_vle32_v_f32m2(q_second + 128, VL);
+            vfloat32m2_t q11 = __riscv_vle32_v_f32m2(q_second + 192, VL);
+            vfloat32m2_t q20 = __riscv_vle32_v_f32m2(q_second + 256, VL);
+            vfloat32m2_t q21 = __riscv_vle32_v_f32m2(q_second + 320, VL);
+            const vfloat32m2_t cv1 = __riscv_vle32_v_f32m2(shared1->c, VL);
+            const vfloat32m2_t sv1 = __riscv_vle32_v_f32m2(shared1->s, VL);
+            rope(q00, q01, cv1, sv1);
+            rope(q10, q11, cv1, sv1);
+            rope(q20, q21, cv1, sv1);
+            // Round rotated Q to FP16 once; attention uses F16 x F16 -> F32.
+            const vfloat16m1_t qh00 = __riscv_vfncvt_f_f_w_f16m1(q00, VL);
+            const vfloat16m1_t qh01 = __riscv_vfncvt_f_f_w_f16m1(q01, VL);
+            const vfloat16m1_t qh10 = __riscv_vfncvt_f_f_w_f16m1(q10, VL);
+            const vfloat16m1_t qh11 = __riscv_vfncvt_f_f_w_f16m1(q11, VL);
+            const vfloat16m1_t qh20 = __riscv_vfncvt_f_f_w_f16m1(q20, VL);
+            const vfloat16m1_t qh21 = __riscv_vfncvt_f_f_w_f16m1(q21, VL);
+            // Online streaming softmax for THREE heads over ONE shared KV pass.
+            // No per-head KV traversal, and no Q/O tensor materialization.
+            float m0 = -__builtin_inff(), m1 = -__builtin_inff(), m2 = -__builtin_inff();
+            float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f;
+            vfloat32m2_t o00=zero, o01=zero, o10=zero, o11=zero, o20=zero, o21=zero;
+            for (int64_t kv = 0; kv < n_kv; ++kv) {
+                const uint8_t * mp = static_cast<const uint8_t *>(mask->data) +
+                                     token * mask->nb[1] + kv * mask->nb[0];
+                float mask_score;
+                if (mask->type == GGML_TYPE_F32) {
+                    mask_score = *reinterpret_cast<const float *>(mp);
+                } else {
+                    const vuint16m1_t mh = __riscv_vle16_v_u16m1(
+                        reinterpret_cast<const uint16_t *>(mp), 1);
+                    mask_score = __riscv_vfmv_f_s_f32m2_f32(
+                        __riscv_vfwcvt_f_f_v_f32m2(
+                            __riscv_vreinterpret_v_u16m1_f16m1(mh), 1));
+                }
+                if (mask_score == -__builtin_inff()) continue;
+
+                const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
+                                     kv * kc->nb[2] + kv_head * kc->nb[1];
+                // K stays in FP16. Widening FP16 MAC keeps the dot-product in FP32.
+                const vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
+                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
+                const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
+                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
+                const auto score = [&](vfloat16m1_t low, vfloat16m1_t high) -> float {
+                    const vfloat32m2_t products = __riscv_vfwmacc_vv_f32m2(
+                        __riscv_vfwmul_vv_f32m2(low, k0, VL), high, k1, VL);
+                    return sum64(products) * ATTN_SCALE + mask_score;
+                };
+                const float s0 = score(qh00, qh01);
+                const float s1 = score(qh10, qh11);
+                const float s2 = score(qh20, qh21);
+
+                const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
+                    (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
+                               kv * vc->nb[2] + kv_head * vc->nb[1]);
+                const ptrdiff_t v_step = static_cast<ptrdiff_t>(v_trans ? vc->nb[2] : vc->nb[0]);
+                const vfloat32m2_t v0 = f16_load64(vp, v_step);
+                const vfloat32m2_t v1 = f16_load64(vp + 64*v_step, v_step);
+                const auto update = [&](float scoreval, float & m, float & l,
+                                        vfloat32m2_t & out0, vfloat32m2_t & out1) {
+                    if (l == 0.0f) {
+                        m = scoreval; l = 1.0f;
+                        out0 = v0; out1 = v1;
+                    } else {
+                        const float new_m = scoreval > m ? scoreval : m;
+                        const float a = exp_neg(m - new_m);
+                        const float b = exp_neg(scoreval - new_m);
+                        l = l*a + b; m = new_m;
+                        out0 = __riscv_vfadd_vv_f32m2(
+                            __riscv_vfmul_vf_f32m2(out0, a, VL),
+                            __riscv_vfmul_vf_f32m2(v0, b, VL), VL);
+                        out1 = __riscv_vfadd_vv_f32m2(
+                            __riscv_vfmul_vf_f32m2(out1, a, VL),
+                            __riscv_vfmul_vf_f32m2(v1, b, VL), VL);
+                    }
+                };
+                update(s0,m0,l0,o00,o01); update(s1,m1,l1,o10,o11); update(s2,m2,l2,o20,o21);
+            }
+            GGML_ASSERT(l0 > 0.0f && l1 > 0.0f && l2 > 0.0f);
+            o00 = __riscv_vfmul_vf_f32m2(o00, 1.0f/l0, VL);
+            o01 = __riscv_vfmul_vf_f32m2(o01, 1.0f/l0, VL);
+            o10 = __riscv_vfmul_vf_f32m2(o10, 1.0f/l1, VL);
+            o11 = __riscv_vfmul_vf_f32m2(o11, 1.0f/l1, VL);
+            o20 = __riscv_vfmul_vf_f32m2(o20, 1.0f/l2, VL);
+            o21 = __riscv_vfmul_vf_f32m2(o21, 1.0f/l2, VL);
+
+            // All twelve Q8 blocks come directly from the six O RVV registers.
+            float d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11;
+            const vint8mf2_t z0 =quant32(o00,0,d0),  z1 =quant32(o00,1,d1);
+            const vint8mf2_t z2 =quant32(o01,0,d2),  z3 =quant32(o01,1,d3);
+            const vint8mf2_t z4 =quant32(o10,0,d4),  z5 =quant32(o10,1,d5);
+            const vint8mf2_t z6 =quant32(o11,0,d6),  z7 =quant32(o11,1,d7);
+            const vint8mf2_t z8 =quant32(o20,0,d8),  z9 =quant32(o20,1,d9);
+            const vint8mf2_t z10=quant32(o21,0,d10), z11=quant32(o21,1,d11);
+
+            // Select one of the twelve live Q8 register blocks per W_O input
+            // block. No addressable O[384] scratch buffer or calls across live
+            // Q8 values. Only each group's final partial-Y is stored.
+            float * y = reinterpret_cast<float *>(static_cast<uint8_t *>(parts->data) +
+                group * parts->nb[2] + token * parts->nb[1]);
+            for (int yt = 0; yt < WO_SUBTILES; ++yt) {
+                const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
+                for (int half = 0; half < 2; ++half) {
+                    vfloat32m4_t accum = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+                    for (int b = 0; b < WO_BLOCKS_PER_Q_GROUP; ++b) {
+                        vint8mf2_t val = z0;
+                        float scale = d0;
+                        switch (b) {
+                            case 1: val = z1; scale = d1; break;
+                            case 2: val = z2; scale = d2; break;
+                            case 3: val = z3; scale = d3; break;
+                            case 4: val = z4; scale = d4; break;
+                            case 5: val = z5; scale = d5; break;
+                            case 6: val = z6; scale = d6; break;
+                            case 7: val = z7; scale = d7; break;
+                            case 8: val = z8; scale = d8; break;
+                            case 9: val = z9; scale = d9; break;
+                            case 10: val = z10; scale = d10; break;
+                            case 11: val = z11; scale = d11; break;
+                            default: break;
+                        }
+                        accum = wo_block_half(subtile + b * WO_BLOCK_BYTES,
+                                              val, scale, accum, half != 0);
+                    }
+                    __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + half * WO_VL,
+                                            accum, WO_VL);
+                }
+            }
+        }
+
     }
 }
 #endif // standard RVV available
