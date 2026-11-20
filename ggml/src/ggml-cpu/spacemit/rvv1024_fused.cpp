@@ -345,18 +345,23 @@ bool prefill_kernel_ready() noexcept {
             const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
                                  kv * kc->nb[2] + kv_head * kc->nb[1];
             // K stays in FP16. Widening FP16 MAC keeps the dot-product in FP32.
-            const vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
+            vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
                 __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
             const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
                 __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
-            const auto score = [&](vfloat16m1_t low, vfloat16m1_t high) -> float {
-                const vfloat32m2_t products = __riscv_vfwmacc_vv_f32m2(
-                    __riscv_vfwmul_vv_f32m2(low, k0, VL), high, k1, VL);
-                return sum64(products) * ATTN_SCALE + mask_score;
-            };
-            const float s0 = score(qh00, qh01);
-            const float s1 = score(qh10, qh11);
-            const float s2 = score(qh20, qh21);
+            // Complete each QxK score before starting the next head.
+            const vfloat32m2_t dot0 = __riscv_vfwmacc_vv_f32m2(
+                __riscv_vfwmul_vv_f32m2(qh00, k0, VL), qh01, k1, VL);
+            const float s0 = sum64(dot0) * ATTN_SCALE + mask_score;
+            // Compile-time dependency only: k0 is unchanged at runtime.
+            __asm__ __volatile__("" : "+vr"(k0) : "f"(s0));
+            const vfloat32m2_t dot1 = __riscv_vfwmacc_vv_f32m2(
+                __riscv_vfwmul_vv_f32m2(qh10, k0, VL), qh11, k1, VL);
+            const float s1 = sum64(dot1) * ATTN_SCALE + mask_score;
+            __asm__ __volatile__("" : "+vr"(k0) : "f"(s1));
+            const vfloat32m2_t dot2 = __riscv_vfwmacc_vv_f32m2(
+                __riscv_vfwmul_vv_f32m2(qh20, k0, VL), qh21, k1, VL);
+            const float s2 = sum64(dot2) * ATTN_SCALE + mask_score;
 
             const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
                 (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
@@ -468,18 +473,23 @@ bool prefill_kernel_ready() noexcept {
                 const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
                                      kv * kc->nb[2] + kv_head * kc->nb[1];
                 // K stays in FP16. Widening FP16 MAC keeps the dot-product in FP32.
-                const vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
+                vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
                     __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
                 const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
                     __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
-                const auto score = [&](vfloat16m1_t low, vfloat16m1_t high) -> float {
-                    const vfloat32m2_t products = __riscv_vfwmacc_vv_f32m2(
-                        __riscv_vfwmul_vv_f32m2(low, k0, VL), high, k1, VL);
-                    return sum64(products) * ATTN_SCALE + mask_score;
-                };
-                const float s0 = score(qh00, qh01);
-                const float s1 = score(qh10, qh11);
-                const float s2 = score(qh20, qh21);
+                // Complete each QxK score before starting the next head.
+                const vfloat32m2_t dot0 = __riscv_vfwmacc_vv_f32m2(
+                    __riscv_vfwmul_vv_f32m2(qh00, k0, VL), qh01, k1, VL);
+                const float s0 = sum64(dot0) * ATTN_SCALE + mask_score;
+                // Compile-time dependency only: k0 is unchanged at runtime.
+                __asm__ __volatile__("" : "+vr"(k0) : "f"(s0));
+                const vfloat32m2_t dot1 = __riscv_vfwmacc_vv_f32m2(
+                    __riscv_vfwmul_vv_f32m2(qh10, k0, VL), qh11, k1, VL);
+                const float s1 = sum64(dot1) * ATTN_SCALE + mask_score;
+                __asm__ __volatile__("" : "+vr"(k0) : "f"(s1));
+                const vfloat32m2_t dot2 = __riscv_vfwmacc_vv_f32m2(
+                    __riscv_vfwmul_vv_f32m2(qh20, k0, VL), qh21, k1, VL);
+                const float s2 = sum64(dot2) * ATTN_SCALE + mask_score;
 
                 const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
                     (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
