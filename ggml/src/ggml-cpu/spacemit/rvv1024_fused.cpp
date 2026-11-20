@@ -128,10 +128,12 @@ bool prefill_kernel_ready() noexcept {
                                   const int8_t * input1_q8, float input1_scale,
                                   vfloat32m2_t & q0_lo, vfloat32m2_t & q0_hi,
                                   vfloat32m2_t & q1_lo, vfloat32m2_t & q1_hi) {
-        vint32m2_t s0_lo = __riscv_vmv_v_x_i32m2(0, VL);
-        vint32m2_t s0_hi = __riscv_vmv_v_x_i32m2(0, VL);
-        vint32m2_t s1_lo = __riscv_vmv_v_x_i32m2(0, VL);
-        vint32m2_t s1_hi = __riscv_vmv_v_x_i32m2(0, VL);
+        // Each 32-term dot product is bounded by 32 * 127 * 8 = 32512.
+        // Accumulate in i16 as the fast RVV repack Q4_0 kernel does.
+        vint16m1_t s0_lo = __riscv_vmv_v_x_i16m1(0, VL);
+        vint16m1_t s0_hi = __riscv_vmv_v_x_i16m1(0, VL);
+        vint16m1_t s1_lo = __riscv_vmv_v_x_i16m1(0, VL);
+        vint16m1_t s1_hi = __riscv_vmv_v_x_i16m1(0, VL);
         for (int k = 0; k < static_cast<int>(QK); ++k) {
             const uint8_t * col = packed_block + k * Q_COL_BYTES + head * (HEAD_DIM / 2);
             const vuint8mf2_t packed = __riscv_vle8_v_u8mf2(col, VL);
@@ -139,14 +141,12 @@ bool prefill_kernel_ready() noexcept {
                 __riscv_vand_vx_u8mf2(packed, 15, VL), 8, VL);
             const vuint8mf2_t highbits = __riscv_vsub_vx_u8mf2(
                 __riscv_vsrl_vx_u8mf2(packed, 4, VL), 8, VL);
-            const vint16m1_t lo16 = __riscv_vsext_vf2_i16m1(
-                __riscv_vreinterpret_v_u8mf2_i8mf2(lowbits), VL);
-            const vint16m1_t hi16 = __riscv_vsext_vf2_i16m1(
-                __riscv_vreinterpret_v_u8mf2_i8mf2(highbits), VL);
-            s0_lo = __riscv_vwmacc_vx_i32m2(s0_lo, static_cast<int16_t>(input0_q8[k]), lo16, VL);
-            s0_hi = __riscv_vwmacc_vx_i32m2(s0_hi, static_cast<int16_t>(input0_q8[k]), hi16, VL);
-            s1_lo = __riscv_vwmacc_vx_i32m2(s1_lo, static_cast<int16_t>(input1_q8[k]), lo16, VL);
-            s1_hi = __riscv_vwmacc_vx_i32m2(s1_hi, static_cast<int16_t>(input1_q8[k]), hi16, VL);
+            const vint8mf2_t lo8 = __riscv_vreinterpret_v_u8mf2_i8mf2(lowbits);
+            const vint8mf2_t hi8 = __riscv_vreinterpret_v_u8mf2_i8mf2(highbits);
+            s0_lo = __riscv_vwmacc_vx_i16m1(s0_lo, input0_q8[k], lo8, VL);
+            s0_hi = __riscv_vwmacc_vx_i16m1(s0_hi, input0_q8[k], hi8, VL);
+            s1_lo = __riscv_vwmacc_vx_i16m1(s1_lo, input1_q8[k], lo8, VL);
+            s1_hi = __riscv_vwmacc_vx_i16m1(s1_hi, input1_q8[k], hi8, VL);
         }
         const float * scales = reinterpret_cast<const float *>(
             packed_block + QK * Q_COL_BYTES) + head * HEAD_DIM;
@@ -154,49 +154,50 @@ bool prefill_kernel_ready() noexcept {
         const vfloat32m2_t scale_hi = __riscv_vle32_v_f32m2(scales + 64, VL);
         q0_lo = __riscv_vfadd_vv_f32m2(q0_lo,
             __riscv_vfmul_vf_f32m2(
-                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s0_lo, VL), scale_lo, VL),
+                __riscv_vfmul_vv_f32m2(__riscv_vfwcvt_f_x_v_f32m2(s0_lo, VL), scale_lo, VL),
                 input0_scale, VL), VL);
         q0_hi = __riscv_vfadd_vv_f32m2(q0_hi,
             __riscv_vfmul_vf_f32m2(
-                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s0_hi, VL), scale_hi, VL),
+                __riscv_vfmul_vv_f32m2(__riscv_vfwcvt_f_x_v_f32m2(s0_hi, VL), scale_hi, VL),
                 input0_scale, VL), VL);
         q1_lo = __riscv_vfadd_vv_f32m2(q1_lo,
             __riscv_vfmul_vf_f32m2(
-                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s1_lo, VL), scale_lo, VL),
+                __riscv_vfmul_vv_f32m2(__riscv_vfwcvt_f_x_v_f32m2(s1_lo, VL), scale_lo, VL),
                 input1_scale, VL), VL);
         q1_hi = __riscv_vfadd_vv_f32m2(q1_hi,
             __riscv_vfmul_vf_f32m2(
-                __riscv_vfmul_vv_f32m2(__riscv_vfcvt_f_x_v_f32m2(s1_hi, VL), scale_hi, VL),
+                __riscv_vfmul_vv_f32m2(__riscv_vfwcvt_f_x_v_f32m2(s1_hi, VL), scale_hi, VL),
                 input1_scale, VL), VL);
     };
 
-    // Small inline W_O microkernel. Keeping this inside the fused function
-    // avoids vector-ABI calls across live O->Q8 register values.
-    const auto wo_block_half = [&](const uint8_t * packed_block,
+    // W_O linear projection: one packed load updates BOTH nibble halves.
+    // Keep two FP32 output accumulators in RVV registers for each 256-row tile.
+    const auto wo_block_both = [&](const uint8_t * packed_block,
                                    vint8mf2_t q8, float x_scale,
-                                   vfloat32m4_t acc, bool high_half) -> vfloat32m4_t {
-        vint32m4_t isum = __riscv_vmv_v_x_i32m4(0, WO_VL);
+                                   vfloat32m4_t & acc_lo, vfloat32m4_t & acc_hi) {
+        vint16m2_t isum_lo = __riscv_vmv_v_x_i16m2(0, WO_VL);
+        vint16m2_t isum_hi = __riscv_vmv_v_x_i16m2(0, WO_VL);
         for (int k = 0; k < static_cast<int>(QK); ++k) {
-            const int16_t xk = __riscv_vmv_x_s_i8mf2_i8(
+            const int8_t xk = __riscv_vmv_x_s_i8mf2_i8(
                 __riscv_vslidedown_vx_i8mf2(q8, k, QK));
             const vuint8m1_t packed = __riscv_vle8_v_u8m1(
                 packed_block + k * WO_COL_BYTES, WO_VL);
-            const vuint8m1_t nibble = high_half ?
-                __riscv_vsrl_vx_u8m1(packed, 4, WO_VL) :
-                __riscv_vand_vx_u8m1(packed, 15, WO_VL);
-            const vint8m1_t signed4 = __riscv_vreinterpret_v_u8m1_i8m1(
-                __riscv_vsub_vx_u8m1(nibble, 8, WO_VL));
-            isum = __riscv_vwmacc_vx_i32m4(isum, xk,
-                __riscv_vsext_vf2_i16m2(signed4, WO_VL), WO_VL);
+            const vint8m1_t lo8 = __riscv_vreinterpret_v_u8m1_i8m1(
+                __riscv_vsub_vx_u8m1(__riscv_vand_vx_u8m1(packed, 15, WO_VL), 8, WO_VL));
+            const vint8m1_t hi8 = __riscv_vreinterpret_v_u8m1_i8m1(
+                __riscv_vsub_vx_u8m1(__riscv_vsrl_vx_u8m1(packed, 4, WO_VL), 8, WO_VL));
+            isum_lo = __riscv_vwmacc_vx_i16m2(isum_lo, xk, lo8, WO_VL);
+            isum_hi = __riscv_vwmacc_vx_i16m2(isum_hi, xk, hi8, WO_VL);
         }
-        const float * scales = reinterpret_cast<const float *>(
-            packed_block + QK * WO_COL_BYTES) + (high_half ? WO_VL : 0);
-        return __riscv_vfadd_vv_f32m4(acc,
+        const float * scales = reinterpret_cast<const float *>(packed_block + QK * WO_COL_BYTES);
+        acc_lo = __riscv_vfadd_vv_f32m4(acc_lo,
             __riscv_vfmul_vf_f32m4(
-                __riscv_vfmul_vv_f32m4(
-                    __riscv_vfcvt_f_x_v_f32m4(isum, WO_VL),
-                    __riscv_vle32_v_f32m4(scales, WO_VL), WO_VL),
-                x_scale, WO_VL), WO_VL);
+                __riscv_vfmul_vv_f32m4(__riscv_vfwcvt_f_x_v_f32m4(isum_lo, WO_VL),
+                    __riscv_vle32_v_f32m4(scales, WO_VL), WO_VL), x_scale, WO_VL), WO_VL);
+        acc_hi = __riscv_vfadd_vv_f32m4(acc_hi,
+            __riscv_vfmul_vf_f32m4(
+                __riscv_vfmul_vv_f32m4(__riscv_vfwcvt_f_x_v_f32m4(isum_hi, WO_VL),
+                    __riscv_vle32_v_f32m4(scales + WO_VL, WO_VL), WO_VL), x_scale, WO_VL), WO_VL);
     };
 
     // Load 64 FP16 K/V elements, supporting GGML's normal and transposed V.
@@ -413,31 +414,24 @@ bool prefill_kernel_ready() noexcept {
             group * parts->nb[2] + token * parts->nb[1]);
         for (int yt = 0; yt < WO_SUBTILES; ++yt) {
             const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
-            for (int half = 0; half < 2; ++half) {
-                vfloat32m4_t accum = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
-                for (int b = 0; b < WO_BLOCKS_PER_Q_GROUP; ++b) {
-                    vint8mf2_t val = z0;
-                    float scale = d0;
-                    switch (b) {
-                        case 1: val = z1; scale = d1; break;
-                        case 2: val = z2; scale = d2; break;
-                        case 3: val = z3; scale = d3; break;
-                        case 4: val = z4; scale = d4; break;
-                        case 5: val = z5; scale = d5; break;
-                        case 6: val = z6; scale = d6; break;
-                        case 7: val = z7; scale = d7; break;
-                        case 8: val = z8; scale = d8; break;
-                        case 9: val = z9; scale = d9; break;
-                        case 10: val = z10; scale = d10; break;
-                        case 11: val = z11; scale = d11; break;
-                        default: break;
-                    }
-                    accum = wo_block_half(subtile + b * WO_BLOCK_BYTES,
-                                          val, scale, accum, half != 0);
-                }
-                __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + half * WO_VL,
-                                        accum, WO_VL);
-            }
+            vfloat32m4_t acc_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+            vfloat32m4_t acc_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+            // Static Q8-register selection. No runtime switch or vector array.
+            // Each call updates both output halves from one weight load per k.
+            wo_block_both(subtile +  0 * WO_BLOCK_BYTES, z0,  d0,  acc_lo, acc_hi);
+            wo_block_both(subtile +  1 * WO_BLOCK_BYTES, z1,  d1,  acc_lo, acc_hi);
+            wo_block_both(subtile +  2 * WO_BLOCK_BYTES, z2,  d2,  acc_lo, acc_hi);
+            wo_block_both(subtile +  3 * WO_BLOCK_BYTES, z3,  d3,  acc_lo, acc_hi);
+            wo_block_both(subtile +  4 * WO_BLOCK_BYTES, z4,  d4,  acc_lo, acc_hi);
+            wo_block_both(subtile +  5 * WO_BLOCK_BYTES, z5,  d5,  acc_lo, acc_hi);
+            wo_block_both(subtile +  6 * WO_BLOCK_BYTES, z6,  d6,  acc_lo, acc_hi);
+            wo_block_both(subtile +  7 * WO_BLOCK_BYTES, z7,  d7,  acc_lo, acc_hi);
+            wo_block_both(subtile +  8 * WO_BLOCK_BYTES, z8,  d8,  acc_lo, acc_hi);
+            wo_block_both(subtile +  9 * WO_BLOCK_BYTES, z9,  d9,  acc_lo, acc_hi);
+            wo_block_both(subtile + 10 * WO_BLOCK_BYTES, z10, d10, acc_lo, acc_hi);
+            wo_block_both(subtile + 11 * WO_BLOCK_BYTES, z11, d11, acc_lo, acc_hi);
+            __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
+            __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
         }
         // Second token: the same attention and W_O, but with its own RoPE
         // coefficients and cached Q projection. No two-iteration token loop.
@@ -541,31 +535,24 @@ bool prefill_kernel_ready() noexcept {
                 group * parts->nb[2] + token * parts->nb[1]);
             for (int yt = 0; yt < WO_SUBTILES; ++yt) {
                 const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
-                for (int half = 0; half < 2; ++half) {
-                    vfloat32m4_t accum = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
-                    for (int b = 0; b < WO_BLOCKS_PER_Q_GROUP; ++b) {
-                        vint8mf2_t val = z0;
-                        float scale = d0;
-                        switch (b) {
-                            case 1: val = z1; scale = d1; break;
-                            case 2: val = z2; scale = d2; break;
-                            case 3: val = z3; scale = d3; break;
-                            case 4: val = z4; scale = d4; break;
-                            case 5: val = z5; scale = d5; break;
-                            case 6: val = z6; scale = d6; break;
-                            case 7: val = z7; scale = d7; break;
-                            case 8: val = z8; scale = d8; break;
-                            case 9: val = z9; scale = d9; break;
-                            case 10: val = z10; scale = d10; break;
-                            case 11: val = z11; scale = d11; break;
-                            default: break;
-                        }
-                        accum = wo_block_half(subtile + b * WO_BLOCK_BYTES,
-                                              val, scale, accum, half != 0);
-                    }
-                    __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + half * WO_VL,
-                                            accum, WO_VL);
-                }
+                vfloat32m4_t acc_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+                vfloat32m4_t acc_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+                // Static Q8-register selection. No runtime switch or vector array.
+                // Each call updates both output halves from one weight load per k.
+                wo_block_both(subtile +  0 * WO_BLOCK_BYTES, z0,  d0,  acc_lo, acc_hi);
+                wo_block_both(subtile +  1 * WO_BLOCK_BYTES, z1,  d1,  acc_lo, acc_hi);
+                wo_block_both(subtile +  2 * WO_BLOCK_BYTES, z2,  d2,  acc_lo, acc_hi);
+                wo_block_both(subtile +  3 * WO_BLOCK_BYTES, z3,  d3,  acc_lo, acc_hi);
+                wo_block_both(subtile +  4 * WO_BLOCK_BYTES, z4,  d4,  acc_lo, acc_hi);
+                wo_block_both(subtile +  5 * WO_BLOCK_BYTES, z5,  d5,  acc_lo, acc_hi);
+                wo_block_both(subtile +  6 * WO_BLOCK_BYTES, z6,  d6,  acc_lo, acc_hi);
+                wo_block_both(subtile +  7 * WO_BLOCK_BYTES, z7,  d7,  acc_lo, acc_hi);
+                wo_block_both(subtile +  8 * WO_BLOCK_BYTES, z8,  d8,  acc_lo, acc_hi);
+                wo_block_both(subtile +  9 * WO_BLOCK_BYTES, z9,  d9,  acc_lo, acc_hi);
+                wo_block_both(subtile + 10 * WO_BLOCK_BYTES, z10, d10, acc_lo, acc_hi);
+                wo_block_both(subtile + 11 * WO_BLOCK_BYTES, z11, d11, acc_lo, acc_hi);
+                __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
+                __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
             }
         }
 
