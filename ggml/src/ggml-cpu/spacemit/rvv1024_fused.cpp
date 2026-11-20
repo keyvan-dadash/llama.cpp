@@ -378,6 +378,54 @@ bool prefill_kernel_ready() noexcept {
                     __riscv_vle32_v_f32m4(scales + WO_VL, WO_VL), WO_VL), x_scale, WO_VL), WO_VL);
     };
 
+    // Weight-stationary two-token W_O: ONE packed vector load supplies both
+    // independent Q8 x Q4_0 dot products. Per-token Q8/weight scales and the
+    // original FP32 accumulation order are preserved. This is not vwmacc.vv:
+    // lanes remain output channels, while each token supplies one Q8 scalar.
+    const auto wo_block_two_tokens = [&](const uint8_t * packed_block,
+                                         const int8_t * q8_first, const int8_t * q8_second,
+                                         float scale_first, float scale_second,
+                                         vfloat32m4_t & first_lo, vfloat32m4_t & first_hi,
+                                         vfloat32m4_t & second_lo, vfloat32m4_t & second_hi) {
+        vint16m2_t sum0_lo = __riscv_vmv_v_x_i16m2(0, WO_VL);
+        vint16m2_t sum0_hi = __riscv_vmv_v_x_i16m2(0, WO_VL);
+        vint16m2_t sum1_lo = __riscv_vmv_v_x_i16m2(0, WO_VL);
+        vint16m2_t sum1_hi = __riscv_vmv_v_x_i16m2(0, WO_VL);
+        for (int k = 0; k < static_cast<int>(QK); ++k) {
+            const int8_t x0 = q8_first[k];
+            const int8_t x1 = q8_second[k];
+            const vuint8m1_t packed = __riscv_vle8_v_u8m1(
+                packed_block + k * WO_COL_BYTES, WO_VL);
+            const vint8m1_t lo8 = __riscv_vreinterpret_v_u8m1_i8m1(
+                __riscv_vsub_vx_u8m1(__riscv_vand_vx_u8m1(packed, 15, WO_VL), 8, WO_VL));
+            const vint8m1_t hi8 = __riscv_vreinterpret_v_u8m1_i8m1(
+                __riscv_vsub_vx_u8m1(__riscv_vsrl_vx_u8m1(packed, 4, WO_VL), 8, WO_VL));
+            sum0_lo = __riscv_vwmacc_vx_i16m2(sum0_lo, x0, lo8, WO_VL);
+            sum0_hi = __riscv_vwmacc_vx_i16m2(sum0_hi, x0, hi8, WO_VL);
+            sum1_lo = __riscv_vwmacc_vx_i16m2(sum1_lo, x1, lo8, WO_VL);
+            sum1_hi = __riscv_vwmacc_vx_i16m2(sum1_hi, x1, hi8, WO_VL);
+        }
+        const float * scales = reinterpret_cast<const float *>(packed_block + QK * WO_COL_BYTES);
+        const vfloat32m4_t w_lo = __riscv_vle32_v_f32m4(scales, WO_VL);
+        first_lo = __riscv_vfadd_vv_f32m4(first_lo,
+            __riscv_vfmul_vf_f32m4(
+                __riscv_vfmul_vv_f32m4(__riscv_vfwcvt_f_x_v_f32m4(sum0_lo, WO_VL),
+                    w_lo, WO_VL), scale_first, WO_VL), WO_VL);
+        second_lo = __riscv_vfadd_vv_f32m4(second_lo,
+            __riscv_vfmul_vf_f32m4(
+                __riscv_vfmul_vv_f32m4(__riscv_vfwcvt_f_x_v_f32m4(sum1_lo, WO_VL),
+                    w_lo, WO_VL), scale_second, WO_VL), WO_VL);
+        const vfloat32m4_t w_hi = __riscv_vle32_v_f32m4(scales + WO_VL, WO_VL);
+        first_hi = __riscv_vfadd_vv_f32m4(first_hi,
+            __riscv_vfmul_vf_f32m4(
+                __riscv_vfmul_vv_f32m4(__riscv_vfwcvt_f_x_v_f32m4(sum0_hi, WO_VL),
+                    w_hi, WO_VL), scale_first, WO_VL), WO_VL);
+        second_hi = __riscv_vfadd_vv_f32m4(second_hi,
+            __riscv_vfmul_vf_f32m4(
+                __riscv_vfmul_vv_f32m4(__riscv_vfwcvt_f_x_v_f32m4(sum1_hi, WO_VL),
+                    w_hi, WO_VL), scale_second, WO_VL), WO_VL);
+    };
+
     // Load 64 FP16 K/V elements, supporting GGML's normal and transposed V.
     const auto f16_load64 = [&](const uint8_t * ptr, ptrdiff_t step) -> vfloat32m2_t {
         const vuint16m1_t bits = step == 2 ?
@@ -550,7 +598,12 @@ bool prefill_kernel_ready() noexcept {
             ++timing.pairs;
         }
 
-        // First token: keep the existing attention, online softmax and W_O.
+        // Two compact Q8 attention outputs per group (2 x 384 B), plus scales.
+        // This lives only for the current token pair, not in the GGML graph.
+        alignas(64) int8_t staged_q8[2][WO_BLOCKS_PER_Q_GROUP][QK];
+        float staged_scales[2][WO_BLOCKS_PER_Q_GROUP];
+
+        // First token: attention and Q8 staging; W_O waits for both tokens.
         const int64_t token = token_pair;
 
         // Online streaming softmax for THREE heads over ONE shared KV pass.
@@ -672,67 +725,38 @@ bool prefill_kernel_ready() noexcept {
         const uint64_t t_attention0_end = phase_tick(timing_mode);
         if (timing_mode) timing.attention += t_attention0_end - t_q_end;
 
-        // All twelve Q8 blocks come directly from the six O RVV registers.
-        float d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11;
-        const vint8mf2_t z0 =quant32(o00,0,d0),  z1 =quant32(o00,1,d1);
-        const vint8mf2_t z2 =quant32(o01,0,d2),  z3 =quant32(o01,1,d3);
-        const vint8mf2_t z4 =quant32(o10,0,d4),  z5 =quant32(o10,1,d5);
-        const vint8mf2_t z6 =quant32(o11,0,d6),  z7 =quant32(o11,1,d7);
-        const vint8mf2_t z8 =quant32(o20,0,d8),  z9 =quant32(o20,1,d9);
-        const vint8mf2_t z10=quant32(o21,0,d10), z11=quant32(o21,1,d11);
+        // Quantize and stage token 0 before W_O. No FP32 O tensor is stored.
+        const vint8mf2_t z0 = quant32(o00, 0, staged_scales[0][0]);
+        const vint8mf2_t z1 = quant32(o00, 1, staged_scales[0][1]);
+        const vint8mf2_t z2 = quant32(o01, 0, staged_scales[0][2]);
+        const vint8mf2_t z3 = quant32(o01, 1, staged_scales[0][3]);
+        const vint8mf2_t z4 = quant32(o10, 0, staged_scales[0][4]);
+        const vint8mf2_t z5 = quant32(o10, 1, staged_scales[0][5]);
+        const vint8mf2_t z6 = quant32(o11, 0, staged_scales[0][6]);
+        const vint8mf2_t z7 = quant32(o11, 1, staged_scales[0][7]);
+        const vint8mf2_t z8 = quant32(o20, 0, staged_scales[0][8]);
+        const vint8mf2_t z9 = quant32(o20, 1, staged_scales[0][9]);
+        const vint8mf2_t z10 = quant32(o21, 0, staged_scales[0][10]);
+        const vint8mf2_t z11 = quant32(o21, 1, staged_scales[0][11]);
+        __riscv_vse8_v_i8mf2(staged_q8[0][0], z0, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][1], z1, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][2], z2, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][3], z3, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][4], z4, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][5], z5, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][6], z6, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][7], z7, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][8], z8, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][9], z9, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][10], z10, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[0][11], z11, QK);
+        __asm__ __volatile__("" : "+m"(staged_q8[0]));
+        const uint64_t t_stage0_end = phase_tick(timing_mode);
+        if (timing_mode) timing.q8_wo += t_stage0_end - t_attention0_end;
 
-        // Diagnostic W_O experiment: stage 12 x 32 Q8 bytes once per token.
-        // This is 384 bytes of local scratch, NOT an O[384] FP32 graph tensor.
-        alignas(64) int8_t staged_q8[WO_BLOCKS_PER_Q_GROUP][QK];
-        __riscv_vse8_v_i8mf2(staged_q8[0], z0, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[1], z1, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[2], z2, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[3], z3, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[4], z4, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[5], z5, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[6], z6, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[7], z7, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[8], z8, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[9], z9, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[10], z10, QK);
-        __riscv_vse8_v_i8mf2(staged_q8[11], z11, QK);
-        // Force the compiler to honor the store/load round trip. Remove this
-        // constraint only when we have checked the target compiler's assembly.
-        __asm__ __volatile__("" : "+m"(staged_q8));
-
-        // Reuse the staged Q8 bytes for all six W_O output subtiles.
-        // Attention O is never materialized as a full FP32 tensor.
-        // Only each group's final partial-Y is stored.
-        float * y = reinterpret_cast<float *>(static_cast<uint8_t *>(parts->data) +
-            group * parts->nb[2] + token * parts->nb[1]);
-        for (int yt = 0; yt < WO_SUBTILES; ++yt) {
-            const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
-            vfloat32m4_t acc_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
-            vfloat32m4_t acc_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
-            // Static staged-Q8 block selection; no runtime dispatch.
-            // Each call still updates both output halves per weight load.
-            wo_block_both(subtile +  0 * WO_BLOCK_BYTES, staged_q8[0],  d0,  acc_lo, acc_hi);
-            wo_block_both(subtile +  1 * WO_BLOCK_BYTES, staged_q8[1],  d1,  acc_lo, acc_hi);
-            wo_block_both(subtile +  2 * WO_BLOCK_BYTES, staged_q8[2],  d2,  acc_lo, acc_hi);
-            wo_block_both(subtile +  3 * WO_BLOCK_BYTES, staged_q8[3],  d3,  acc_lo, acc_hi);
-            wo_block_both(subtile +  4 * WO_BLOCK_BYTES, staged_q8[4],  d4,  acc_lo, acc_hi);
-            wo_block_both(subtile +  5 * WO_BLOCK_BYTES, staged_q8[5],  d5,  acc_lo, acc_hi);
-            wo_block_both(subtile +  6 * WO_BLOCK_BYTES, staged_q8[6],  d6,  acc_lo, acc_hi);
-            wo_block_both(subtile +  7 * WO_BLOCK_BYTES, staged_q8[7],  d7,  acc_lo, acc_hi);
-            wo_block_both(subtile +  8 * WO_BLOCK_BYTES, staged_q8[8],  d8,  acc_lo, acc_hi);
-            wo_block_both(subtile +  9 * WO_BLOCK_BYTES, staged_q8[9],  d9,  acc_lo, acc_hi);
-            wo_block_both(subtile + 10 * WO_BLOCK_BYTES, staged_q8[10], d10, acc_lo, acc_hi);
-            wo_block_both(subtile + 11 * WO_BLOCK_BYTES, staged_q8[11], d11, acc_lo, acc_hi);
-            __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
-            __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
-        }
-        const uint64_t t_wo0_end = phase_tick(timing_mode);
-        if (timing_mode) {
-            timing.q8_wo += t_wo0_end - t_attention0_end;
-            ++timing.tokens;
-        }
-        // Second token: the same attention and W_O, but with its own RoPE
-        // coefficients and cached Q projection. No two-iteration token loop.
+        // The first token is staged; keep its bytes/scales while token 1 attends.
+        uint64_t t_wo_begin = t_stage0_end;
+        // Second token: reuse projected Q, perform attention, then stage Q8.
         if (has_second) {
             const int64_t token = token_pair + 1;
             // Use token 2's Q vectors prepared above; no Q loads or RoPE here.
@@ -859,66 +883,141 @@ bool prefill_kernel_ready() noexcept {
             o20 = __riscv_vfmul_vf_f32m2(o20, 1.0f/l2, VL);
             o21 = __riscv_vfmul_vf_f32m2(o21, 1.0f/l2, VL);
             const uint64_t t_attention1_end = phase_tick(timing_mode);
-            if (timing_mode) timing.attention += t_attention1_end - t_wo0_end;
+            if (timing_mode) timing.attention += t_attention1_end - t_stage0_end;
 
-            // All twelve Q8 blocks come directly from the six O RVV registers.
-            float d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11;
-            const vint8mf2_t z0 =quant32(o00,0,d0),  z1 =quant32(o00,1,d1);
-            const vint8mf2_t z2 =quant32(o01,0,d2),  z3 =quant32(o01,1,d3);
-            const vint8mf2_t z4 =quant32(o10,0,d4),  z5 =quant32(o10,1,d5);
-            const vint8mf2_t z6 =quant32(o11,0,d6),  z7 =quant32(o11,1,d7);
-            const vint8mf2_t z8 =quant32(o20,0,d8),  z9 =quant32(o20,1,d9);
-            const vint8mf2_t z10=quant32(o21,0,d10), z11=quant32(o21,1,d11);
+            // Quantize and stage token 1 before W_O. No FP32 O tensor is stored.
+            const vint8mf2_t z0 = quant32(o00, 0, staged_scales[1][0]);
+            const vint8mf2_t z1 = quant32(o00, 1, staged_scales[1][1]);
+            const vint8mf2_t z2 = quant32(o01, 0, staged_scales[1][2]);
+            const vint8mf2_t z3 = quant32(o01, 1, staged_scales[1][3]);
+            const vint8mf2_t z4 = quant32(o10, 0, staged_scales[1][4]);
+            const vint8mf2_t z5 = quant32(o10, 1, staged_scales[1][5]);
+            const vint8mf2_t z6 = quant32(o11, 0, staged_scales[1][6]);
+            const vint8mf2_t z7 = quant32(o11, 1, staged_scales[1][7]);
+            const vint8mf2_t z8 = quant32(o20, 0, staged_scales[1][8]);
+            const vint8mf2_t z9 = quant32(o20, 1, staged_scales[1][9]);
+            const vint8mf2_t z10 = quant32(o21, 0, staged_scales[1][10]);
+            const vint8mf2_t z11 = quant32(o21, 1, staged_scales[1][11]);
+            __riscv_vse8_v_i8mf2(staged_q8[1][0], z0, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][1], z1, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][2], z2, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][3], z3, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][4], z4, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][5], z5, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][6], z6, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][7], z7, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][8], z8, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][9], z9, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][10], z10, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1][11], z11, QK);
+            __asm__ __volatile__("" : "+m"(staged_q8[1]));
+            t_wo_begin = phase_tick(timing_mode);
+            if (timing_mode) timing.q8_wo += t_wo_begin - t_attention1_end;
+        }
 
-            // Diagnostic W_O experiment: stage 12 x 32 Q8 bytes once per token.
-            // This is 384 bytes of local scratch, NOT an O[384] FP32 graph tensor.
-            alignas(64) int8_t staged_q8[WO_BLOCKS_PER_Q_GROUP][QK];
-            __riscv_vse8_v_i8mf2(staged_q8[0], z0, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[1], z1, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[2], z2, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[3], z3, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[4], z4, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[5], z5, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[6], z6, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[7], z7, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[8], z8, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[9], z9, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[10], z10, QK);
-            __riscv_vse8_v_i8mf2(staged_q8[11], z11, QK);
-            // Force the compiler to honor the store/load round trip. Remove this
-            // constraint only when we have checked the target compiler's assembly.
-            __asm__ __volatile__("" : "+m"(staged_q8));
-
-            // Reuse the staged Q8 bytes for all six W_O output subtiles.
-            // Attention O is never materialized as a full FP32 tensor.
-            // Only each group's final partial-Y is stored.
-            float * y = reinterpret_cast<float *>(static_cast<uint8_t *>(parts->data) +
-                group * parts->nb[2] + token * parts->nb[1]);
+        // ONE W_O packed-weight traversal for both tokens. Each 128-byte load
+        // updates both independent partial-Y outputs; nothing writes a full
+        // FP32 attention O tensor. Odd final token uses the single-token path.
+        float * y0 = reinterpret_cast<float *>(static_cast<uint8_t *>(parts->data) +
+            group * parts->nb[2] + token_pair * parts->nb[1]);
+        if (has_second) {
+            float * y1 = reinterpret_cast<float *>(static_cast<uint8_t *>(parts->data) +
+                group * parts->nb[2] + (token_pair + 1) * parts->nb[1]);
+            for (int yt = 0; yt < WO_SUBTILES; ++yt) {
+                const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
+                vfloat32m4_t a0_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+                vfloat32m4_t a0_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+                vfloat32m4_t a1_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+                vfloat32m4_t a1_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
+                wo_block_two_tokens(subtile +  0 * WO_BLOCK_BYTES,
+                    staged_q8[0][0], staged_q8[1][0],
+                    staged_scales[0][0], staged_scales[1][0],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  1 * WO_BLOCK_BYTES,
+                    staged_q8[0][1], staged_q8[1][1],
+                    staged_scales[0][1], staged_scales[1][1],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  2 * WO_BLOCK_BYTES,
+                    staged_q8[0][2], staged_q8[1][2],
+                    staged_scales[0][2], staged_scales[1][2],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  3 * WO_BLOCK_BYTES,
+                    staged_q8[0][3], staged_q8[1][3],
+                    staged_scales[0][3], staged_scales[1][3],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  4 * WO_BLOCK_BYTES,
+                    staged_q8[0][4], staged_q8[1][4],
+                    staged_scales[0][4], staged_scales[1][4],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  5 * WO_BLOCK_BYTES,
+                    staged_q8[0][5], staged_q8[1][5],
+                    staged_scales[0][5], staged_scales[1][5],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  6 * WO_BLOCK_BYTES,
+                    staged_q8[0][6], staged_q8[1][6],
+                    staged_scales[0][6], staged_scales[1][6],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  7 * WO_BLOCK_BYTES,
+                    staged_q8[0][7], staged_q8[1][7],
+                    staged_scales[0][7], staged_scales[1][7],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  8 * WO_BLOCK_BYTES,
+                    staged_q8[0][8], staged_q8[1][8],
+                    staged_scales[0][8], staged_scales[1][8],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile +  9 * WO_BLOCK_BYTES,
+                    staged_q8[0][9], staged_q8[1][9],
+                    staged_scales[0][9], staged_scales[1][9],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile + 10 * WO_BLOCK_BYTES,
+                    staged_q8[0][10], staged_q8[1][10],
+                    staged_scales[0][10], staged_scales[1][10],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                wo_block_two_tokens(subtile + 11 * WO_BLOCK_BYTES,
+                    staged_q8[0][11], staged_q8[1][11],
+                    staged_scales[0][11], staged_scales[1][11],
+                    a0_lo, a0_hi, a1_lo, a1_hi);
+                __riscv_vse32_v_f32m4(y0 + yt * WO_SUBTILE_OUTPUTS, a0_lo, WO_VL);
+                __riscv_vse32_v_f32m4(y0 + yt * WO_SUBTILE_OUTPUTS + WO_VL, a0_hi, WO_VL);
+                __riscv_vse32_v_f32m4(y1 + yt * WO_SUBTILE_OUTPUTS, a1_lo, WO_VL);
+                __riscv_vse32_v_f32m4(y1 + yt * WO_SUBTILE_OUTPUTS + WO_VL, a1_hi, WO_VL);
+            }
+        } else {
             for (int yt = 0; yt < WO_SUBTILES; ++yt) {
                 const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
                 vfloat32m4_t acc_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
                 vfloat32m4_t acc_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
-                // Static staged-Q8 block selection; no runtime dispatch.
-                // Each call still updates both output halves per weight load.
-                wo_block_both(subtile +  0 * WO_BLOCK_BYTES, staged_q8[0],  d0,  acc_lo, acc_hi);
-                wo_block_both(subtile +  1 * WO_BLOCK_BYTES, staged_q8[1],  d1,  acc_lo, acc_hi);
-                wo_block_both(subtile +  2 * WO_BLOCK_BYTES, staged_q8[2],  d2,  acc_lo, acc_hi);
-                wo_block_both(subtile +  3 * WO_BLOCK_BYTES, staged_q8[3],  d3,  acc_lo, acc_hi);
-                wo_block_both(subtile +  4 * WO_BLOCK_BYTES, staged_q8[4],  d4,  acc_lo, acc_hi);
-                wo_block_both(subtile +  5 * WO_BLOCK_BYTES, staged_q8[5],  d5,  acc_lo, acc_hi);
-                wo_block_both(subtile +  6 * WO_BLOCK_BYTES, staged_q8[6],  d6,  acc_lo, acc_hi);
-                wo_block_both(subtile +  7 * WO_BLOCK_BYTES, staged_q8[7],  d7,  acc_lo, acc_hi);
-                wo_block_both(subtile +  8 * WO_BLOCK_BYTES, staged_q8[8],  d8,  acc_lo, acc_hi);
-                wo_block_both(subtile +  9 * WO_BLOCK_BYTES, staged_q8[9],  d9,  acc_lo, acc_hi);
-                wo_block_both(subtile + 10 * WO_BLOCK_BYTES, staged_q8[10], d10, acc_lo, acc_hi);
-                wo_block_both(subtile + 11 * WO_BLOCK_BYTES, staged_q8[11], d11, acc_lo, acc_hi);
-                __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
-                __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
+                wo_block_both(subtile +  0 * WO_BLOCK_BYTES,
+                    staged_q8[0][0], staged_scales[0][0], acc_lo, acc_hi);
+                wo_block_both(subtile +  1 * WO_BLOCK_BYTES,
+                    staged_q8[0][1], staged_scales[0][1], acc_lo, acc_hi);
+                wo_block_both(subtile +  2 * WO_BLOCK_BYTES,
+                    staged_q8[0][2], staged_scales[0][2], acc_lo, acc_hi);
+                wo_block_both(subtile +  3 * WO_BLOCK_BYTES,
+                    staged_q8[0][3], staged_scales[0][3], acc_lo, acc_hi);
+                wo_block_both(subtile +  4 * WO_BLOCK_BYTES,
+                    staged_q8[0][4], staged_scales[0][4], acc_lo, acc_hi);
+                wo_block_both(subtile +  5 * WO_BLOCK_BYTES,
+                    staged_q8[0][5], staged_scales[0][5], acc_lo, acc_hi);
+                wo_block_both(subtile +  6 * WO_BLOCK_BYTES,
+                    staged_q8[0][6], staged_scales[0][6], acc_lo, acc_hi);
+                wo_block_both(subtile +  7 * WO_BLOCK_BYTES,
+                    staged_q8[0][7], staged_scales[0][7], acc_lo, acc_hi);
+                wo_block_both(subtile +  8 * WO_BLOCK_BYTES,
+                    staged_q8[0][8], staged_scales[0][8], acc_lo, acc_hi);
+                wo_block_both(subtile +  9 * WO_BLOCK_BYTES,
+                    staged_q8[0][9], staged_scales[0][9], acc_lo, acc_hi);
+                wo_block_both(subtile + 10 * WO_BLOCK_BYTES,
+                    staged_q8[0][10], staged_scales[0][10], acc_lo, acc_hi);
+                wo_block_both(subtile + 11 * WO_BLOCK_BYTES,
+                    staged_q8[0][11], staged_scales[0][11], acc_lo, acc_hi);
+                __riscv_vse32_v_f32m4(y0 + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
+                __riscv_vse32_v_f32m4(y0 + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
             }
-            if (timing_mode) {
-                timing.q8_wo += phase_tick(timing_mode) - t_attention1_end;
-                ++timing.tokens;
-            }
+        }
+        if (timing_mode) {
+            timing.q8_wo += phase_tick(timing_mode) - t_wo_begin;
+            timing.tokens += has_second ? 2 : 1;
         }
 
     }
