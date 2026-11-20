@@ -1256,7 +1256,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft_list = buft_list_cpu;
         }
 
-        ggml_backend_buffer_type_t buft = nullptr;
+        // RVV1024 blobs are opaque I8 arrays, not weights for CPU_REPACK.
+        // GGML_OP_NONE bypasses weight_buft_supported(), otherwise causing
+        // select_weight_buft() to choose CPU_REPACK and dereference a null
+        // tensor_traits pointer in its set_tensor() callback.
+        ggml_backend_buffer_type_t buft = rvv1024_packed ? ggml_backend_cpu_buffer_type() : nullptr;
 
         // Overrides must not relocate the raw RVV weights to a GPU buffer.
         if (tensor_buft_overrides && !rvv1024_packed) {
