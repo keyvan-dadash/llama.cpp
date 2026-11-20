@@ -351,13 +351,13 @@ bool prefill_kernel_ready() noexcept {
     // W_O linear projection: one packed load updates BOTH nibble halves.
     // Keep two FP32 output accumulators in RVV registers for each 256-row tile.
     const auto wo_block_both = [&](const uint8_t * packed_block,
-                                   vint8mf2_t q8, float x_scale,
+                                   const int8_t * q8_bytes, float x_scale,
                                    vfloat32m4_t & acc_lo, vfloat32m4_t & acc_hi) {
         vint16m2_t isum_lo = __riscv_vmv_v_x_i16m2(0, WO_VL);
         vint16m2_t isum_hi = __riscv_vmv_v_x_i16m2(0, WO_VL);
         for (int k = 0; k < static_cast<int>(QK); ++k) {
-            const int8_t xk = __riscv_vmv_x_s_i8mf2_i8(
-                __riscv_vslidedown_vx_i8mf2(q8, k, QK));
+            // Q8 was staged once, before the six W_O output subtiles.
+            const int8_t xk = q8_bytes[k];
             const vuint8m1_t packed = __riscv_vle8_v_u8m1(
                 packed_block + k * WO_COL_BYTES, WO_VL);
             const vint8m1_t lo8 = __riscv_vreinterpret_v_u8m1_i8m1(
@@ -681,29 +681,48 @@ bool prefill_kernel_ready() noexcept {
         const vint8mf2_t z8 =quant32(o20,0,d8),  z9 =quant32(o20,1,d9);
         const vint8mf2_t z10=quant32(o21,0,d10), z11=quant32(o21,1,d11);
 
-        // Select one of the twelve live Q8 register blocks per W_O input
-        // block. No addressable O[384] scratch buffer or calls across live
-        // Q8 values. Only each group's final partial-Y is stored.
+        // Diagnostic W_O experiment: stage 12 x 32 Q8 bytes once per token.
+        // This is 384 bytes of local scratch, NOT an O[384] FP32 graph tensor.
+        alignas(64) int8_t staged_q8[WO_BLOCKS_PER_Q_GROUP][QK];
+        __riscv_vse8_v_i8mf2(staged_q8[0], z0, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[1], z1, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[2], z2, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[3], z3, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[4], z4, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[5], z5, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[6], z6, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[7], z7, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[8], z8, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[9], z9, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[10], z10, QK);
+        __riscv_vse8_v_i8mf2(staged_q8[11], z11, QK);
+        // Force the compiler to honor the store/load round trip. Remove this
+        // constraint only when we have checked the target compiler's assembly.
+        __asm__ __volatile__("" : "+m"(staged_q8));
+
+        // Reuse the staged Q8 bytes for all six W_O output subtiles.
+        // Attention O is never materialized as a full FP32 tensor.
+        // Only each group's final partial-Y is stored.
         float * y = reinterpret_cast<float *>(static_cast<uint8_t *>(parts->data) +
             group * parts->nb[2] + token * parts->nb[1]);
         for (int yt = 0; yt < WO_SUBTILES; ++yt) {
             const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
             vfloat32m4_t acc_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
             vfloat32m4_t acc_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
-            // Static Q8-register selection. No runtime switch or vector array.
-            // Each call updates both output halves from one weight load per k.
-            wo_block_both(subtile +  0 * WO_BLOCK_BYTES, z0,  d0,  acc_lo, acc_hi);
-            wo_block_both(subtile +  1 * WO_BLOCK_BYTES, z1,  d1,  acc_lo, acc_hi);
-            wo_block_both(subtile +  2 * WO_BLOCK_BYTES, z2,  d2,  acc_lo, acc_hi);
-            wo_block_both(subtile +  3 * WO_BLOCK_BYTES, z3,  d3,  acc_lo, acc_hi);
-            wo_block_both(subtile +  4 * WO_BLOCK_BYTES, z4,  d4,  acc_lo, acc_hi);
-            wo_block_both(subtile +  5 * WO_BLOCK_BYTES, z5,  d5,  acc_lo, acc_hi);
-            wo_block_both(subtile +  6 * WO_BLOCK_BYTES, z6,  d6,  acc_lo, acc_hi);
-            wo_block_both(subtile +  7 * WO_BLOCK_BYTES, z7,  d7,  acc_lo, acc_hi);
-            wo_block_both(subtile +  8 * WO_BLOCK_BYTES, z8,  d8,  acc_lo, acc_hi);
-            wo_block_both(subtile +  9 * WO_BLOCK_BYTES, z9,  d9,  acc_lo, acc_hi);
-            wo_block_both(subtile + 10 * WO_BLOCK_BYTES, z10, d10, acc_lo, acc_hi);
-            wo_block_both(subtile + 11 * WO_BLOCK_BYTES, z11, d11, acc_lo, acc_hi);
+            // Static staged-Q8 block selection; no runtime dispatch.
+            // Each call still updates both output halves per weight load.
+            wo_block_both(subtile +  0 * WO_BLOCK_BYTES, staged_q8[0],  d0,  acc_lo, acc_hi);
+            wo_block_both(subtile +  1 * WO_BLOCK_BYTES, staged_q8[1],  d1,  acc_lo, acc_hi);
+            wo_block_both(subtile +  2 * WO_BLOCK_BYTES, staged_q8[2],  d2,  acc_lo, acc_hi);
+            wo_block_both(subtile +  3 * WO_BLOCK_BYTES, staged_q8[3],  d3,  acc_lo, acc_hi);
+            wo_block_both(subtile +  4 * WO_BLOCK_BYTES, staged_q8[4],  d4,  acc_lo, acc_hi);
+            wo_block_both(subtile +  5 * WO_BLOCK_BYTES, staged_q8[5],  d5,  acc_lo, acc_hi);
+            wo_block_both(subtile +  6 * WO_BLOCK_BYTES, staged_q8[6],  d6,  acc_lo, acc_hi);
+            wo_block_both(subtile +  7 * WO_BLOCK_BYTES, staged_q8[7],  d7,  acc_lo, acc_hi);
+            wo_block_both(subtile +  8 * WO_BLOCK_BYTES, staged_q8[8],  d8,  acc_lo, acc_hi);
+            wo_block_both(subtile +  9 * WO_BLOCK_BYTES, staged_q8[9],  d9,  acc_lo, acc_hi);
+            wo_block_both(subtile + 10 * WO_BLOCK_BYTES, staged_q8[10], d10, acc_lo, acc_hi);
+            wo_block_both(subtile + 11 * WO_BLOCK_BYTES, staged_q8[11], d11, acc_lo, acc_hi);
             __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
             __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
         }
@@ -851,29 +870,48 @@ bool prefill_kernel_ready() noexcept {
             const vint8mf2_t z8 =quant32(o20,0,d8),  z9 =quant32(o20,1,d9);
             const vint8mf2_t z10=quant32(o21,0,d10), z11=quant32(o21,1,d11);
 
-            // Select one of the twelve live Q8 register blocks per W_O input
-            // block. No addressable O[384] scratch buffer or calls across live
-            // Q8 values. Only each group's final partial-Y is stored.
+            // Diagnostic W_O experiment: stage 12 x 32 Q8 bytes once per token.
+            // This is 384 bytes of local scratch, NOT an O[384] FP32 graph tensor.
+            alignas(64) int8_t staged_q8[WO_BLOCKS_PER_Q_GROUP][QK];
+            __riscv_vse8_v_i8mf2(staged_q8[0], z0, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[1], z1, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[2], z2, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[3], z3, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[4], z4, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[5], z5, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[6], z6, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[7], z7, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[8], z8, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[9], z9, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[10], z10, QK);
+            __riscv_vse8_v_i8mf2(staged_q8[11], z11, QK);
+            // Force the compiler to honor the store/load round trip. Remove this
+            // constraint only when we have checked the target compiler's assembly.
+            __asm__ __volatile__("" : "+m"(staged_q8));
+
+            // Reuse the staged Q8 bytes for all six W_O output subtiles.
+            // Attention O is never materialized as a full FP32 tensor.
+            // Only each group's final partial-Y is stored.
             float * y = reinterpret_cast<float *>(static_cast<uint8_t *>(parts->data) +
                 group * parts->nb[2] + token * parts->nb[1]);
             for (int yt = 0; yt < WO_SUBTILES; ++yt) {
                 const uint8_t * subtile = wo_tile + static_cast<size_t>(yt) * WO_SUBTILE_BYTES;
                 vfloat32m4_t acc_lo = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
                 vfloat32m4_t acc_hi = __riscv_vfmv_v_f_f32m4(0.0f, WO_VL);
-                // Static Q8-register selection. No runtime switch or vector array.
-                // Each call updates both output halves from one weight load per k.
-                wo_block_both(subtile +  0 * WO_BLOCK_BYTES, z0,  d0,  acc_lo, acc_hi);
-                wo_block_both(subtile +  1 * WO_BLOCK_BYTES, z1,  d1,  acc_lo, acc_hi);
-                wo_block_both(subtile +  2 * WO_BLOCK_BYTES, z2,  d2,  acc_lo, acc_hi);
-                wo_block_both(subtile +  3 * WO_BLOCK_BYTES, z3,  d3,  acc_lo, acc_hi);
-                wo_block_both(subtile +  4 * WO_BLOCK_BYTES, z4,  d4,  acc_lo, acc_hi);
-                wo_block_both(subtile +  5 * WO_BLOCK_BYTES, z5,  d5,  acc_lo, acc_hi);
-                wo_block_both(subtile +  6 * WO_BLOCK_BYTES, z6,  d6,  acc_lo, acc_hi);
-                wo_block_both(subtile +  7 * WO_BLOCK_BYTES, z7,  d7,  acc_lo, acc_hi);
-                wo_block_both(subtile +  8 * WO_BLOCK_BYTES, z8,  d8,  acc_lo, acc_hi);
-                wo_block_both(subtile +  9 * WO_BLOCK_BYTES, z9,  d9,  acc_lo, acc_hi);
-                wo_block_both(subtile + 10 * WO_BLOCK_BYTES, z10, d10, acc_lo, acc_hi);
-                wo_block_both(subtile + 11 * WO_BLOCK_BYTES, z11, d11, acc_lo, acc_hi);
+                // Static staged-Q8 block selection; no runtime dispatch.
+                // Each call still updates both output halves per weight load.
+                wo_block_both(subtile +  0 * WO_BLOCK_BYTES, staged_q8[0],  d0,  acc_lo, acc_hi);
+                wo_block_both(subtile +  1 * WO_BLOCK_BYTES, staged_q8[1],  d1,  acc_lo, acc_hi);
+                wo_block_both(subtile +  2 * WO_BLOCK_BYTES, staged_q8[2],  d2,  acc_lo, acc_hi);
+                wo_block_both(subtile +  3 * WO_BLOCK_BYTES, staged_q8[3],  d3,  acc_lo, acc_hi);
+                wo_block_both(subtile +  4 * WO_BLOCK_BYTES, staged_q8[4],  d4,  acc_lo, acc_hi);
+                wo_block_both(subtile +  5 * WO_BLOCK_BYTES, staged_q8[5],  d5,  acc_lo, acc_hi);
+                wo_block_both(subtile +  6 * WO_BLOCK_BYTES, staged_q8[6],  d6,  acc_lo, acc_hi);
+                wo_block_both(subtile +  7 * WO_BLOCK_BYTES, staged_q8[7],  d7,  acc_lo, acc_hi);
+                wo_block_both(subtile +  8 * WO_BLOCK_BYTES, staged_q8[8],  d8,  acc_lo, acc_hi);
+                wo_block_both(subtile +  9 * WO_BLOCK_BYTES, staged_q8[9],  d9,  acc_lo, acc_hi);
+                wo_block_both(subtile + 10 * WO_BLOCK_BYTES, staged_q8[10], d10, acc_lo, acc_hi);
+                wo_block_both(subtile + 11 * WO_BLOCK_BYTES, staged_q8[11], d11, acc_lo, acc_hi);
                 __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
                 __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
             }
