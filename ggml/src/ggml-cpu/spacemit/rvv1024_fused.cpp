@@ -4,6 +4,10 @@
 
 #include <cmath>
 #include <cstring>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 
 // GCC's standard RVV header, NOT the SpacemiT/IME intrinsic interface.
 #if defined(__riscv_v) && defined(__riscv_v_intrinsic)
@@ -11,6 +15,112 @@
 #endif
 
 namespace spacemit_kernels::rvv::fused1024 {
+// Diagnostic-only timing: see LLAMA_RVV1024_PHASE_PROFILE below.
+// The default path does not read counters or print anything.
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic)
+namespace {
+
+// Each record measures one three-Q-head group. Q+RoPE runs once per token
+// pair; attention and Q8+W_O each run once per *real* token.
+struct phase_local {
+    uint64_t q_rope = 0;
+    uint64_t attention = 0;
+    uint64_t q8_wo = 0;
+    uint64_t pairs = 0;
+    uint64_t tokens = 0;
+};
+
+struct phase_shared {
+    std::atomic<uint64_t> q_rope{0};
+    std::atomic<uint64_t> attention{0};
+    std::atomic<uint64_t> q8_wo{0};
+    std::atomic<uint64_t> pairs{0};
+    std::atomic<uint64_t> tokens{0};
+};
+
+// 0 = disabled; 1 = CLOCK_MONOTONIC_RAW nanoseconds (safe); 2 = rdcycle ticks.
+static int phase_mode() {
+    static const int mode = [] {
+        const char * env = std::getenv("LLAMA_RVV1024_PHASE_PROFILE");
+        if (env && std::strcmp(env, "ns") == 0)     return 1;
+        if (env && std::strcmp(env, "cycles") == 0) return 2;
+        return 0;
+    }();
+    return mode;
+}
+
+// In 'cycles' mode this is one inlined CSR read, not a function call.
+// RISC-V Linux may forbid U-mode rdcycle (SIGILL); use 'ns' in that case.
+static inline uint64_t phase_tick(int mode) {
+    if (mode == 0) return 0;
+    if (mode == 2) {
+        uint64_t ticks;
+        __asm__ __volatile__("rdcycle %0" : "=r"(ticks) :: "memory");
+        return ticks;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+
+struct phase_report {
+    phase_shared groups[N_Q_GROUPS];
+
+    ~phase_report() {
+        uint64_t total_q = 0, total_attn = 0, total_wo = 0;
+        uint64_t total_pairs = 0, total_tokens = 0;
+        const char * unit = phase_mode() == 2 ? "cycles" : "ns";
+        for (int g = 0; g < N_Q_GROUPS; ++g) {
+            const auto & s = groups[g];
+            const uint64_t q = s.q_rope.load(std::memory_order_relaxed);
+            const uint64_t a = s.attention.load(std::memory_order_relaxed);
+            const uint64_t w = s.q8_wo.load(std::memory_order_relaxed);
+            const uint64_t p = s.pairs.load(std::memory_order_relaxed);
+            const uint64_t t = s.tokens.load(std::memory_order_relaxed);
+            if (p == 0) continue;
+            total_q += q; total_attn += a; total_wo += w;
+            total_pairs += p; total_tokens += t;
+            std::fprintf(stderr,
+                "[RVV1024_PHASE] group=%d pairs=%llu tokens=%llu "
+                "q_rope=%llu attention=%llu q8_wo=%llu (%s)\n",
+                g, (unsigned long long) p, (unsigned long long) t,
+                (unsigned long long) q, (unsigned long long) a,
+                (unsigned long long) w, unit);
+        }
+        if (total_pairs == 0) return;
+        const double sum = double(total_q) + double(total_attn) + double(total_wo);
+        std::fprintf(stderr,
+            "[RVV1024_PHASE] TOTAL unit=%s pairs=%llu tokens=%llu "
+            "Q+RoPE=%.1f%% attention=%.1f%% Q8+W_O=%.1f%% "
+            "q_rope=%llu attention=%llu q8_wo=%llu\n",
+            unit, (unsigned long long) total_pairs, (unsigned long long) total_tokens,
+            100.0 * double(total_q) / sum,
+            100.0 * double(total_attn) / sum,
+            100.0 * double(total_wo) / sum,
+            (unsigned long long) total_q, (unsigned long long) total_attn,
+            (unsigned long long) total_wo);
+        std::fprintf(stderr,
+            "[RVV1024_PHASE] These are summed worker timestamps over all layers "
+            "and runs, NOT wall time; X/RoPE preparation and partial-Y "
+            "reduction are excluded.\n");
+    }
+};
+
+static phase_report & phase_stats() {
+    static phase_report stats;
+    return stats;
+}
+
+static void phase_record(int group, const phase_local & local) {
+    phase_shared & s = phase_stats().groups[group];
+    s.q_rope.fetch_add(local.q_rope, std::memory_order_relaxed);
+    s.attention.fetch_add(local.attention, std::memory_order_relaxed);
+    s.q8_wo.fetch_add(local.q8_wo, std::memory_order_relaxed);
+    s.pairs.fetch_add(local.pairs, std::memory_order_relaxed);
+    s.tokens.fetch_add(local.tokens, std::memory_order_relaxed);
+}
+} // namespace
+#endif // RVV phase timing
 
 bool hardware_vlen_supported() noexcept {
 #if defined(__riscv_v) && defined(__riscv_v_intrinsic)
@@ -115,6 +225,9 @@ bool prefill_kernel_ready() noexcept {
 
     const uint8_t * q_tile  = static_cast<const uint8_t *>(wq->data) + group * Q_GROUP_BYTES;
     const uint8_t * wo_tile = static_cast<const uint8_t *>(wo->data) + group * WO_GROUP_BYTES;
+
+    const int timing_mode = phase_mode();
+    phase_local timing{};
 
     // One 32-input block, ONE head (128 outputs). Per input column a single
     // contiguous e8mf2 load (64 bytes) supplies both output halves via its
@@ -261,6 +374,7 @@ bool prefill_kernel_ready() noexcept {
     // One pair at a time. The separate graph node already quantized both
     // inputs and prepared both sets of NEOX RoPE coefficients.
     for (int64_t token_pair = 0; token_pair < prepared->ne[1]; token_pair += 2) {
+        const uint64_t t_q_begin = phase_tick(timing_mode);
         const auto * shared0 = reinterpret_cast<const prefill_prepared_token *>(
             static_cast<const uint8_t *>(prepared->data) + token_pair * prepared->nb[1]);
         const bool has_second = token_pair + 1 < prepared->ne[1];
@@ -319,6 +433,11 @@ bool prefill_kernel_ready() noexcept {
         project_head_pair(0, qh00, qh01, qh00_second, qh01_second);
         project_head_pair(1, qh10, qh11, qh10_second, qh11_second);
         project_head_pair(2, qh20, qh21, qh20_second, qh21_second);
+        const uint64_t t_q_end = phase_tick(timing_mode);
+        if (timing_mode) {
+            timing.q_rope += t_q_end - t_q_begin;
+            ++timing.pairs;
+        }
 
         // First token: keep the existing attention, online softmax and W_O.
         const int64_t token = token_pair;
@@ -397,6 +516,8 @@ bool prefill_kernel_ready() noexcept {
         o11 = __riscv_vfmul_vf_f32m2(o11, 1.0f/l1, VL);
         o20 = __riscv_vfmul_vf_f32m2(o20, 1.0f/l2, VL);
         o21 = __riscv_vfmul_vf_f32m2(o21, 1.0f/l2, VL);
+        const uint64_t t_attention0_end = phase_tick(timing_mode);
+        if (timing_mode) timing.attention += t_attention0_end - t_q_end;
 
         // All twelve Q8 blocks come directly from the six O RVV registers.
         float d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11;
@@ -432,6 +553,11 @@ bool prefill_kernel_ready() noexcept {
             wo_block_both(subtile + 11 * WO_BLOCK_BYTES, z11, d11, acc_lo, acc_hi);
             __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
             __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
+        }
+        const uint64_t t_wo0_end = phase_tick(timing_mode);
+        if (timing_mode) {
+            timing.q8_wo += t_wo0_end - t_attention0_end;
+            ++timing.tokens;
         }
         // Second token: the same attention and W_O, but with its own RoPE
         // coefficients and cached Q projection. No two-iteration token loop.
@@ -518,6 +644,8 @@ bool prefill_kernel_ready() noexcept {
             o11 = __riscv_vfmul_vf_f32m2(o11, 1.0f/l1, VL);
             o20 = __riscv_vfmul_vf_f32m2(o20, 1.0f/l2, VL);
             o21 = __riscv_vfmul_vf_f32m2(o21, 1.0f/l2, VL);
+            const uint64_t t_attention1_end = phase_tick(timing_mode);
+            if (timing_mode) timing.attention += t_attention1_end - t_wo0_end;
 
             // All twelve Q8 blocks come directly from the six O RVV registers.
             float d0,d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11;
@@ -554,9 +682,14 @@ bool prefill_kernel_ready() noexcept {
                 __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS, acc_lo, WO_VL);
                 __riscv_vse32_v_f32m4(y + yt * WO_SUBTILE_OUTPUTS + WO_VL, acc_hi, WO_VL);
             }
+            if (timing_mode) {
+                timing.q8_wo += phase_tick(timing_mode) - t_attention1_end;
+                ++timing.tokens;
+            }
         }
 
     }
+    if (timing_mode) phase_record(group, timing);
 }
 #endif // standard RVV available
 
