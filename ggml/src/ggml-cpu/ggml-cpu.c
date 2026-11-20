@@ -16,9 +16,7 @@
 #include "common.h"
 #include "tiled/tiled.h"
 
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-#    include "rvv1024_compare_profile.h"
-#endif
+#include "rvv1024_compare_profile.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -3128,12 +3126,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     const bool rvv1024_compare_profile = rvv1024_cmp_enabled();
     if (rvv1024_compare_profile) {
         rvv1024_cmp_register_report();
     }
-#endif
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
@@ -3168,10 +3164,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
         const int rvv1024_bucket = rvv1024_compare_profile ? rvv1024_cmp_classify(node) : -1;
         const uint64_t rvv1024_t0 = rvv1024_bucket >= 0 ? rvv1024_cmp_tick() : 0;
-#endif
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -3182,11 +3176,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_compute_forward(&params, node);
         }
 
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
         if (rvv1024_bucket >= 0) {
             rvv1024_cmp_accumulate(rvv1024_bucket, rvv1024_cmp_tick() - rvv1024_t0);
         }
-#endif
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {

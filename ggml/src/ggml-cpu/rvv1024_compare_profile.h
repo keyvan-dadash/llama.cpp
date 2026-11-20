@@ -152,7 +152,10 @@ static inline int rvv1024_cmp_classify(const struct ggml_tensor * node) {
     if (node->op == GGML_OP_CUSTOM) {
         if (strcmp(node->name, "rvv1024_prepared_x_rope") == 0) return RVV1024_CMP_PREP;
         if (strcmp(node->name, "rvv1024_partial_y") == 0)       return RVV1024_CMP_FUSED;
-        if (strcmp(node->name, "rvv1024_attn_out") == 0)        return RVV1024_CMP_REDUCE;
+        if (strncmp(node->name,
+            "rvv1024_attn_out-",
+            sizeof("rvv1024_attn_out-") - 1) == 0)
+            return RVV1024_CMP_REDUCE;
     }
     return -1;
 }
