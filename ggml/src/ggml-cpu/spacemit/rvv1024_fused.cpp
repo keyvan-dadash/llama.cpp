@@ -283,6 +283,71 @@ bool prefill_kernel_ready() noexcept {
                 input1_scale, VL), VL);
     };
 
+    // Experimental 2-head x 2-token Q4_0 x Q8 microkernel.
+    // The packed ABI interleaves [head0:64B][head1:64B][head2:64B]
+    // for each input column, so an e8m1 load covers heads 0 and 1.
+    // Lanes 0..63 are head 0; lanes 64..127 are head 1. The Q4
+    // low/high nibbles remain the two 64-output halves of each head.
+    // This reduces eight 64-lane vwmaccs to four 128-lane vwmaccs
+    // per input column, without modifying packed GGUF weights.
+    const auto q_two_head_block = [&](const uint8_t * packed_block,
+                                      const int8_t * input0_q8, float input0_scale,
+                                      const int8_t * input1_q8, float input1_scale,
+                                      vfloat32m2_t & h0_t0_lo, vfloat32m2_t & h0_t0_hi,
+                                      vfloat32m2_t & h0_t1_lo, vfloat32m2_t & h0_t1_hi,
+                                      vfloat32m2_t & h1_t0_lo, vfloat32m2_t & h1_t0_hi,
+                                      vfloat32m2_t & h1_t1_lo, vfloat32m2_t & h1_t1_hi) {
+        constexpr size_t TWO_HEAD_VL = 2 * VL; // 128 e8m1 / i16m2 lanes
+        vint16m2_t s0_lo = __riscv_vmv_v_x_i16m2(0, TWO_HEAD_VL);
+        vint16m2_t s0_hi = __riscv_vmv_v_x_i16m2(0, TWO_HEAD_VL);
+        vint16m2_t s1_lo = __riscv_vmv_v_x_i16m2(0, TWO_HEAD_VL);
+        vint16m2_t s1_hi = __riscv_vmv_v_x_i16m2(0, TWO_HEAD_VL);
+
+        for (int k = 0; k < static_cast<int>(QK); ++k) {
+            const uint8_t * col = packed_block + k * Q_COL_BYTES;
+            const vuint8m1_t packed = __riscv_vle8_v_u8m1(col, TWO_HEAD_VL);
+            const vint8m1_t lo8 = __riscv_vreinterpret_v_u8m1_i8m1(
+                __riscv_vsub_vx_u8m1(
+                    __riscv_vand_vx_u8m1(packed, 15, TWO_HEAD_VL), 8, TWO_HEAD_VL));
+            const vint8m1_t hi8 = __riscv_vreinterpret_v_u8m1_i8m1(
+                __riscv_vsub_vx_u8m1(
+                    __riscv_vsrl_vx_u8m1(packed, 4, TWO_HEAD_VL), 8, TWO_HEAD_VL));
+            s0_lo = __riscv_vwmacc_vx_i16m2(s0_lo, input0_q8[k], lo8, TWO_HEAD_VL);
+            s0_hi = __riscv_vwmacc_vx_i16m2(s0_hi, input0_q8[k], hi8, TWO_HEAD_VL);
+            s1_lo = __riscv_vwmacc_vx_i16m2(s1_lo, input1_q8[k], lo8, TWO_HEAD_VL);
+            s1_hi = __riscv_vwmacc_vx_i16m2(s1_hi, input1_q8[k], hi8, TWO_HEAD_VL);
+        }
+
+        // Extract the two 64-lane heads without a memory round trip.
+        // Each i16m2 accumulator holds both heads' corresponding half.
+        const float * scales = reinterpret_cast<const float *>(
+            packed_block + QK * Q_COL_BYTES);
+        const auto scaled_add = [&](vfloat32m2_t & dst, vint16m1_t sum,
+                                    vfloat32m2_t weight_scale, float x_scale) {
+            dst = __riscv_vfadd_vv_f32m2(dst,
+                __riscv_vfmul_vf_f32m2(
+                    __riscv_vfmul_vv_f32m2(
+                        __riscv_vfwcvt_f_x_v_f32m2(sum, VL), weight_scale, VL),
+                    x_scale, VL), VL);
+        };
+        {
+            const vfloat32m2_t scale_lo = __riscv_vle32_v_f32m2(scales, VL);
+            const vfloat32m2_t scale_hi = __riscv_vle32_v_f32m2(scales + VL, VL);
+            scaled_add(h0_t0_lo, __riscv_vget_v_i16m2_i16m1(s0_lo, 0), scale_lo, input0_scale);
+            scaled_add(h0_t0_hi, __riscv_vget_v_i16m2_i16m1(s0_hi, 0), scale_hi, input0_scale);
+            scaled_add(h0_t1_lo, __riscv_vget_v_i16m2_i16m1(s1_lo, 0), scale_lo, input1_scale);
+            scaled_add(h0_t1_hi, __riscv_vget_v_i16m2_i16m1(s1_hi, 0), scale_hi, input1_scale);
+        }
+        {
+            const vfloat32m2_t scale_lo = __riscv_vle32_v_f32m2(scales + HEAD_DIM, VL);
+            const vfloat32m2_t scale_hi = __riscv_vle32_v_f32m2(scales + HEAD_DIM + VL, VL);
+            scaled_add(h1_t0_lo, __riscv_vget_v_i16m2_i16m1(s0_lo, 1), scale_lo, input0_scale);
+            scaled_add(h1_t0_hi, __riscv_vget_v_i16m2_i16m1(s0_hi, 1), scale_hi, input0_scale);
+            scaled_add(h1_t1_lo, __riscv_vget_v_i16m2_i16m1(s1_lo, 1), scale_lo, input1_scale);
+            scaled_add(h1_t1_hi, __riscv_vget_v_i16m2_i16m1(s1_hi, 1), scale_hi, input1_scale);
+        }
+    };
+
     // W_O linear projection: one packed load updates BOTH nibble halves.
     // Keep two FP32 output accumulators in RVV registers for each 256-row tile.
     const auto wo_block_both = [&](const uint8_t * packed_block,
@@ -428,10 +493,56 @@ bool prefill_kernel_ready() noexcept {
             t1_hi = __riscv_vfncvt_f_f_w_f16m1(q1_hi, VL);
         };
 
+        // Pair heads 0 and 1 over the same input-block traversal. We keep
+        // the existing one-head/two-token path for head 2 as a control.
+        const auto project_two_heads_pair = [&](
+                vfloat16m1_t & h0_t0_lo, vfloat16m1_t & h0_t0_hi,
+                vfloat16m1_t & h0_t1_lo, vfloat16m1_t & h0_t1_hi,
+                vfloat16m1_t & h1_t0_lo, vfloat16m1_t & h1_t0_hi,
+                vfloat16m1_t & h1_t1_lo, vfloat16m1_t & h1_t1_hi) {
+            const float * bias0 = bias;
+            const float * bias1 = bias ? bias + HEAD_DIM : nullptr;
+            vfloat32m2_t q00_lo = bias0 ? __riscv_vle32_v_f32m2(bias0, VL) : zero;
+            vfloat32m2_t q00_hi = bias0 ? __riscv_vle32_v_f32m2(bias0 + VL, VL) : zero;
+            vfloat32m2_t q01_lo = q00_lo, q01_hi = q00_hi;
+            vfloat32m2_t q10_lo = bias1 ? __riscv_vle32_v_f32m2(bias1, VL) : zero;
+            vfloat32m2_t q10_hi = bias1 ? __riscv_vle32_v_f32m2(bias1 + VL, VL) : zero;
+            vfloat32m2_t q11_lo = q10_lo, q11_hi = q10_hi;
+
+            for (int b = 0; b < Q_BLOCKS; ++b) {
+                const uint8_t * block = q_tile + static_cast<size_t>(b) * Q_BLOCK_BYTES;
+                q_two_head_block(block,
+                    shared0->x8[b].qs, shared0->x8[b].scale,
+                    shared1->x8[b].qs, shared1->x8[b].scale,
+                    q00_lo, q00_hi, q01_lo, q01_hi,
+                    q10_lo, q10_hi, q11_lo, q11_hi);
+            }
+
+            // The bias/scales and FP32 RoPE order match project_head_pair().
+            const vfloat32m2_t cv0 = __riscv_vle32_v_f32m2(shared0->c, VL);
+            const vfloat32m2_t sv0 = __riscv_vle32_v_f32m2(shared0->s, VL);
+            rope(q00_lo, q00_hi, cv0, sv0);
+            rope(q10_lo, q10_hi, cv0, sv0);
+            h0_t0_lo = __riscv_vfncvt_f_f_w_f16m1(q00_lo, VL);
+            h0_t0_hi = __riscv_vfncvt_f_f_w_f16m1(q00_hi, VL);
+            h1_t0_lo = __riscv_vfncvt_f_f_w_f16m1(q10_lo, VL);
+            h1_t0_hi = __riscv_vfncvt_f_f_w_f16m1(q10_hi, VL);
+
+            const vfloat32m2_t cv1 = __riscv_vle32_v_f32m2(shared1->c, VL);
+            const vfloat32m2_t sv1 = __riscv_vle32_v_f32m2(shared1->s, VL);
+            rope(q01_lo, q01_hi, cv1, sv1);
+            rope(q11_lo, q11_hi, cv1, sv1);
+            h0_t1_lo = __riscv_vfncvt_f_f_w_f16m1(q01_lo, VL);
+            h0_t1_hi = __riscv_vfncvt_f_f_w_f16m1(q01_hi, VL);
+            h1_t1_lo = __riscv_vfncvt_f_f_w_f16m1(q11_lo, VL);
+            h1_t1_hi = __riscv_vfncvt_f_f_w_f16m1(q11_hi, VL);
+        };
+
         vfloat16m1_t qh00, qh01, qh10, qh11, qh20, qh21;
         vfloat16m1_t qh00_second, qh01_second, qh10_second, qh11_second, qh20_second, qh21_second;
-        project_head_pair(0, qh00, qh01, qh00_second, qh01_second);
-        project_head_pair(1, qh10, qh11, qh10_second, qh11_second);
+        project_two_heads_pair(
+            qh00, qh01, qh00_second, qh01_second,
+            qh10, qh11, qh10_second, qh11_second);
         project_head_pair(2, qh20, qh21, qh20_second, qh21_second);
         const uint64_t t_q_end = phase_tick(timing_mode);
         if (timing_mode) {
