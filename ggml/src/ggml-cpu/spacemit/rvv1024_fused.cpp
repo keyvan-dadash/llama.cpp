@@ -447,67 +447,109 @@ bool prefill_kernel_ready() noexcept {
         float m0 = -__builtin_inff(), m1 = -__builtin_inff(), m2 = -__builtin_inff();
         float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f;
         vfloat32m2_t o00=zero, o01=zero, o10=zero, o11=zero, o20=zero, o21=zero;
-        for (int64_t kv = 0; kv < n_kv; ++kv) {
-            const uint8_t * mp = static_cast<const uint8_t *>(mask->data) +
-                                 token * mask->nb[1] + kv * mask->nb[0];
-            float mask_score;
-            if (mask->type == GGML_TYPE_F32) {
-                mask_score = *reinterpret_cast<const float *>(mp);
-            } else {
-                const vuint16m1_t mh = __riscv_vle16_v_u16m1(
-                    reinterpret_cast<const uint16_t *>(mp), 1);
-                mask_score = __riscv_vfmv_f_s_f32m2_f32(
-                    __riscv_vfwcvt_f_f_v_f32m2(
-                        __riscv_vreinterpret_v_u16m1_f16m1(mh), 1));
-            }
-            if (mask_score == -__builtin_inff()) continue;
+        // The same blockwise online-softmax recurrence as ggml's CPU tiled
+        // FlashAttention, directly in this fused kernel. Only 3 x 64 FP32 scores
+        // are materialized (768 bytes); Q and the unnormalized FP32 U vectors stay
+        // in the existing register-fused path. No full KQ/O tensor is produced.
+        constexpr int ATTN_KV_TILE = 64;
+        for (int64_t kv_base = 0; kv_base < n_kv; kv_base += ATTN_KV_TILE) {
+            const int tile_len = static_cast<int>(
+                n_kv - kv_base < ATTN_KV_TILE ? n_kv - kv_base : ATTN_KV_TILE);
+            float score0[ATTN_KV_TILE], score1[ATTN_KV_TILE], score2[ATTN_KV_TILE];
+            float tile_m0 = -__builtin_inff();
+            float tile_m1 = -__builtin_inff();
+            float tile_m2 = -__builtin_inff();
 
-            const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
-                                 kv * kc->nb[2] + kv_head * kc->nb[1];
-            // K stays in FP16. Widening FP16 MAC keeps the dot-product in FP32.
-            vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
-                __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
-            const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
-                __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
-            // Complete each QxK score before starting the next head.
-            const vfloat32m2_t dot0 = __riscv_vfwmacc_vv_f32m2(
-                __riscv_vfwmul_vv_f32m2(qh00, k0, VL), qh01, k1, VL);
-            const float s0 = sum64(dot0) * ATTN_SCALE + mask_score;
-            // Compile-time dependency only: k0 is unchanged at runtime.
-            __asm__ __volatile__("" : "+vr"(k0) : "f"(s0));
-            const vfloat32m2_t dot1 = __riscv_vfwmacc_vv_f32m2(
-                __riscv_vfwmul_vv_f32m2(qh10, k0, VL), qh11, k1, VL);
-            const float s1 = sum64(dot1) * ATTN_SCALE + mask_score;
-            __asm__ __volatile__("" : "+vr"(k0) : "f"(s1));
-            const vfloat32m2_t dot2 = __riscv_vfwmacc_vv_f32m2(
-                __riscv_vfwmul_vv_f32m2(qh20, k0, VL), qh21, k1, VL);
-            const float s2 = sum64(dot2) * ATTN_SCALE + mask_score;
-
-            const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
-                (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
-                           kv * vc->nb[2] + kv_head * vc->nb[1]);
-            const ptrdiff_t v_step = static_cast<ptrdiff_t>(v_trans ? vc->nb[2] : vc->nb[0]);
-            const vfloat32m2_t v0 = f16_load64(vp, v_step);
-            const vfloat32m2_t v1 = f16_load64(vp + 64*v_step, v_step);
-            const auto update = [&](float scoreval, float & m, float & l,
-                                    vfloat32m2_t & out0, vfloat32m2_t & out1) {
-                if (l == 0.0f) {
-                    m = scoreval; l = 1.0f;
-                    out0 = v0; out1 = v1;
+            // Stage 1: compute all three Q.K score rows against one K tile.
+            // A K vector is fetched only once per key for these three heads.
+            for (int t = 0; t < tile_len; ++t) {
+                const int64_t kv = kv_base + t;
+                const uint8_t * mp = static_cast<const uint8_t *>(mask->data) +
+                                     token * mask->nb[1] + kv * mask->nb[0];
+                float mask_score;
+                if (mask->type == GGML_TYPE_F32) {
+                    mask_score = *reinterpret_cast<const float *>(mp);
                 } else {
-                    const float new_m = scoreval > m ? scoreval : m;
-                    const float a = exp_neg(m - new_m);
-                    const float b = exp_neg(scoreval - new_m);
-                    l = l*a + b; m = new_m;
-                    out0 = __riscv_vfadd_vv_f32m2(
-                        __riscv_vfmul_vf_f32m2(out0, a, VL),
-                        __riscv_vfmul_vf_f32m2(v0, b, VL), VL);
-                    out1 = __riscv_vfadd_vv_f32m2(
-                        __riscv_vfmul_vf_f32m2(out1, a, VL),
-                        __riscv_vfmul_vf_f32m2(v1, b, VL), VL);
+                    const vuint16m1_t mh = __riscv_vle16_v_u16m1(
+                        reinterpret_cast<const uint16_t *>(mp), 1);
+                    mask_score = __riscv_vfmv_f_s_f32m2_f32(
+                        __riscv_vfwcvt_f_f_v_f32m2(
+                            __riscv_vreinterpret_v_u16m1_f16m1(mh), 1));
                 }
+                if (mask_score == -__builtin_inff()) {
+                    score0[t] = score1[t] = score2[t] = -__builtin_inff();
+                    continue;
+                }
+
+                const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
+                                     kv * kc->nb[2] + kv_head * kc->nb[1];
+                vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
+                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
+                const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
+                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
+                const vfloat32m2_t dot0 = __riscv_vfwmacc_vv_f32m2(
+                    __riscv_vfwmul_vv_f32m2(qh00, k0, VL), qh01, k1, VL);
+                score0[t] = sum64(dot0) * ATTN_SCALE + mask_score;
+                // Preserve the original score-order constraint in this experiment.
+                __asm__ __volatile__("" : "+vr"(k0) : "f"(score0[t]));
+                const vfloat32m2_t dot1 = __riscv_vfwmacc_vv_f32m2(
+                    __riscv_vfwmul_vv_f32m2(qh10, k0, VL), qh11, k1, VL);
+                score1[t] = sum64(dot1) * ATTN_SCALE + mask_score;
+                __asm__ __volatile__("" : "+vr"(k0) : "f"(score1[t]));
+                const vfloat32m2_t dot2 = __riscv_vfwmacc_vv_f32m2(
+                    __riscv_vfwmul_vv_f32m2(qh20, k0, VL), qh21, k1, VL);
+                score2[t] = sum64(dot2) * ATTN_SCALE + mask_score;
+                if (score0[t] > tile_m0) tile_m0 = score0[t];
+                if (score1[t] > tile_m1) tile_m1 = score1[t];
+                if (score2[t] > tile_m2) tile_m2 = score2[t];
+            }
+
+            // A fully causally masked tile contributes nothing to m, l, or U.
+            if (tile_m0 == -__builtin_inff() &&
+                tile_m1 == -__builtin_inff() && tile_m2 == -__builtin_inff()) continue;
+
+            // Stage 2: merge the tile maximum into the running online softmax.
+            // Rescale U at most ONCE per KV tile, not once per KV position.
+            const auto merge_max = [&](float tile_m, float & m, float & l,
+                                       vfloat32m2_t & u0, vfloat32m2_t & u1) {
+                if (tile_m == -__builtin_inff()) return;
+                const float new_m = tile_m > m ? tile_m : m;
+                if (l != 0.0f && new_m > m) {
+                    const float alpha = exp_neg(m - new_m);
+                    l *= alpha;
+                    u0 = __riscv_vfmul_vf_f32m2(u0, alpha, VL);
+                    u1 = __riscv_vfmul_vf_f32m2(u1, alpha, VL);
+                }
+                m = new_m;
             };
-            update(s0,m0,l0,o00,o01); update(s1,m1,l1,o10,o11); update(s2,m2,l2,o20,o21);
+            merge_max(tile_m0, m0, l0, o00, o01);
+            merge_max(tile_m1, m1, l1, o10, o11);
+            merge_max(tile_m2, m2, l2, o20, o21);
+
+            // Stage 3: P_tile * V_tile, accumulating the same unnormalized FP32 U.
+            // The V cache is read once per key and shared by the three heads.
+            for (int t = 0; t < tile_len; ++t) {
+                if (score0[t] == -__builtin_inff() &&
+                    score1[t] == -__builtin_inff() && score2[t] == -__builtin_inff()) continue;
+                const float p0 = score0[t] == -__builtin_inff() ? 0.0f : exp_neg(score0[t] - m0);
+                const float p1 = score1[t] == -__builtin_inff() ? 0.0f : exp_neg(score1[t] - m1);
+                const float p2 = score2[t] == -__builtin_inff() ? 0.0f : exp_neg(score2[t] - m2);
+                l0 += p0; l1 += p1; l2 += p2;
+
+                const int64_t kv = kv_base + t;
+                const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
+                    (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
+                               kv * vc->nb[2] + kv_head * vc->nb[1]);
+                const ptrdiff_t v_step = static_cast<ptrdiff_t>(v_trans ? vc->nb[2] : vc->nb[0]);
+                const vfloat32m2_t v0 = f16_load64(vp, v_step);
+                const vfloat32m2_t v1 = f16_load64(vp + 64*v_step, v_step);
+                o00 = __riscv_vfmacc_vf_f32m2(o00, p0, v0, VL);
+                o01 = __riscv_vfmacc_vf_f32m2(o01, p0, v1, VL);
+                o10 = __riscv_vfmacc_vf_f32m2(o10, p1, v0, VL);
+                o11 = __riscv_vfmacc_vf_f32m2(o11, p1, v1, VL);
+                o20 = __riscv_vfmacc_vf_f32m2(o20, p2, v0, VL);
+                o21 = __riscv_vfmacc_vf_f32m2(o21, p2, v1, VL);
+            }
         }
         GGML_ASSERT(l0 > 0.0f && l1 > 0.0f && l2 > 0.0f);
         o00 = __riscv_vfmul_vf_f32m2(o00, 1.0f/l0, VL);
@@ -575,67 +617,109 @@ bool prefill_kernel_ready() noexcept {
             float m0 = -__builtin_inff(), m1 = -__builtin_inff(), m2 = -__builtin_inff();
             float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f;
             vfloat32m2_t o00=zero, o01=zero, o10=zero, o11=zero, o20=zero, o21=zero;
-            for (int64_t kv = 0; kv < n_kv; ++kv) {
-                const uint8_t * mp = static_cast<const uint8_t *>(mask->data) +
-                                     token * mask->nb[1] + kv * mask->nb[0];
-                float mask_score;
-                if (mask->type == GGML_TYPE_F32) {
-                    mask_score = *reinterpret_cast<const float *>(mp);
-                } else {
-                    const vuint16m1_t mh = __riscv_vle16_v_u16m1(
-                        reinterpret_cast<const uint16_t *>(mp), 1);
-                    mask_score = __riscv_vfmv_f_s_f32m2_f32(
-                        __riscv_vfwcvt_f_f_v_f32m2(
-                            __riscv_vreinterpret_v_u16m1_f16m1(mh), 1));
-                }
-                if (mask_score == -__builtin_inff()) continue;
+            // The same blockwise online-softmax recurrence as ggml's CPU tiled
+            // FlashAttention, directly in this fused kernel. Only 3 x 64 FP32 scores
+            // are materialized (768 bytes); Q and the unnormalized FP32 U vectors stay
+            // in the existing register-fused path. No full KQ/O tensor is produced.
+            constexpr int ATTN_KV_TILE = 64;
+            for (int64_t kv_base = 0; kv_base < n_kv; kv_base += ATTN_KV_TILE) {
+                const int tile_len = static_cast<int>(
+                    n_kv - kv_base < ATTN_KV_TILE ? n_kv - kv_base : ATTN_KV_TILE);
+                float score0[ATTN_KV_TILE], score1[ATTN_KV_TILE], score2[ATTN_KV_TILE];
+                float tile_m0 = -__builtin_inff();
+                float tile_m1 = -__builtin_inff();
+                float tile_m2 = -__builtin_inff();
 
-                const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
-                                     kv * kc->nb[2] + kv_head * kc->nb[1];
-                // K stays in FP16. Widening FP16 MAC keeps the dot-product in FP32.
-                vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
-                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
-                const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
-                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
-                // Complete each QxK score before starting the next head.
-                const vfloat32m2_t dot0 = __riscv_vfwmacc_vv_f32m2(
-                    __riscv_vfwmul_vv_f32m2(qh00, k0, VL), qh01, k1, VL);
-                const float s0 = sum64(dot0) * ATTN_SCALE + mask_score;
-                // Compile-time dependency only: k0 is unchanged at runtime.
-                __asm__ __volatile__("" : "+vr"(k0) : "f"(s0));
-                const vfloat32m2_t dot1 = __riscv_vfwmacc_vv_f32m2(
-                    __riscv_vfwmul_vv_f32m2(qh10, k0, VL), qh11, k1, VL);
-                const float s1 = sum64(dot1) * ATTN_SCALE + mask_score;
-                __asm__ __volatile__("" : "+vr"(k0) : "f"(s1));
-                const vfloat32m2_t dot2 = __riscv_vfwmacc_vv_f32m2(
-                    __riscv_vfwmul_vv_f32m2(qh20, k0, VL), qh21, k1, VL);
-                const float s2 = sum64(dot2) * ATTN_SCALE + mask_score;
-
-                const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
-                    (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
-                               kv * vc->nb[2] + kv_head * vc->nb[1]);
-                const ptrdiff_t v_step = static_cast<ptrdiff_t>(v_trans ? vc->nb[2] : vc->nb[0]);
-                const vfloat32m2_t v0 = f16_load64(vp, v_step);
-                const vfloat32m2_t v1 = f16_load64(vp + 64*v_step, v_step);
-                const auto update = [&](float scoreval, float & m, float & l,
-                                        vfloat32m2_t & out0, vfloat32m2_t & out1) {
-                    if (l == 0.0f) {
-                        m = scoreval; l = 1.0f;
-                        out0 = v0; out1 = v1;
+                // Stage 1: compute all three Q.K score rows against one K tile.
+                // A K vector is fetched only once per key for these three heads.
+                for (int t = 0; t < tile_len; ++t) {
+                    const int64_t kv = kv_base + t;
+                    const uint8_t * mp = static_cast<const uint8_t *>(mask->data) +
+                                         token * mask->nb[1] + kv * mask->nb[0];
+                    float mask_score;
+                    if (mask->type == GGML_TYPE_F32) {
+                        mask_score = *reinterpret_cast<const float *>(mp);
                     } else {
-                        const float new_m = scoreval > m ? scoreval : m;
-                        const float a = exp_neg(m - new_m);
-                        const float b = exp_neg(scoreval - new_m);
-                        l = l*a + b; m = new_m;
-                        out0 = __riscv_vfadd_vv_f32m2(
-                            __riscv_vfmul_vf_f32m2(out0, a, VL),
-                            __riscv_vfmul_vf_f32m2(v0, b, VL), VL);
-                        out1 = __riscv_vfadd_vv_f32m2(
-                            __riscv_vfmul_vf_f32m2(out1, a, VL),
-                            __riscv_vfmul_vf_f32m2(v1, b, VL), VL);
+                        const vuint16m1_t mh = __riscv_vle16_v_u16m1(
+                            reinterpret_cast<const uint16_t *>(mp), 1);
+                        mask_score = __riscv_vfmv_f_s_f32m2_f32(
+                            __riscv_vfwcvt_f_f_v_f32m2(
+                                __riscv_vreinterpret_v_u16m1_f16m1(mh), 1));
                     }
+                    if (mask_score == -__builtin_inff()) {
+                        score0[t] = score1[t] = score2[t] = -__builtin_inff();
+                        continue;
+                    }
+
+                    const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
+                                         kv * kc->nb[2] + kv_head * kc->nb[1];
+                    vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
+                        __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp), VL));
+                    const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
+                        __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kp + 64*kc->nb[0]), VL));
+                    const vfloat32m2_t dot0 = __riscv_vfwmacc_vv_f32m2(
+                        __riscv_vfwmul_vv_f32m2(qh00, k0, VL), qh01, k1, VL);
+                    score0[t] = sum64(dot0) * ATTN_SCALE + mask_score;
+                    // Preserve the original score-order constraint in this experiment.
+                    __asm__ __volatile__("" : "+vr"(k0) : "f"(score0[t]));
+                    const vfloat32m2_t dot1 = __riscv_vfwmacc_vv_f32m2(
+                        __riscv_vfwmul_vv_f32m2(qh10, k0, VL), qh11, k1, VL);
+                    score1[t] = sum64(dot1) * ATTN_SCALE + mask_score;
+                    __asm__ __volatile__("" : "+vr"(k0) : "f"(score1[t]));
+                    const vfloat32m2_t dot2 = __riscv_vfwmacc_vv_f32m2(
+                        __riscv_vfwmul_vv_f32m2(qh20, k0, VL), qh21, k1, VL);
+                    score2[t] = sum64(dot2) * ATTN_SCALE + mask_score;
+                    if (score0[t] > tile_m0) tile_m0 = score0[t];
+                    if (score1[t] > tile_m1) tile_m1 = score1[t];
+                    if (score2[t] > tile_m2) tile_m2 = score2[t];
+                }
+
+                // A fully causally masked tile contributes nothing to m, l, or U.
+                if (tile_m0 == -__builtin_inff() &&
+                    tile_m1 == -__builtin_inff() && tile_m2 == -__builtin_inff()) continue;
+
+                // Stage 2: merge the tile maximum into the running online softmax.
+                // Rescale U at most ONCE per KV tile, not once per KV position.
+                const auto merge_max = [&](float tile_m, float & m, float & l,
+                                           vfloat32m2_t & u0, vfloat32m2_t & u1) {
+                    if (tile_m == -__builtin_inff()) return;
+                    const float new_m = tile_m > m ? tile_m : m;
+                    if (l != 0.0f && new_m > m) {
+                        const float alpha = exp_neg(m - new_m);
+                        l *= alpha;
+                        u0 = __riscv_vfmul_vf_f32m2(u0, alpha, VL);
+                        u1 = __riscv_vfmul_vf_f32m2(u1, alpha, VL);
+                    }
+                    m = new_m;
                 };
-                update(s0,m0,l0,o00,o01); update(s1,m1,l1,o10,o11); update(s2,m2,l2,o20,o21);
+                merge_max(tile_m0, m0, l0, o00, o01);
+                merge_max(tile_m1, m1, l1, o10, o11);
+                merge_max(tile_m2, m2, l2, o20, o21);
+
+                // Stage 3: P_tile * V_tile, accumulating the same unnormalized FP32 U.
+                // The V cache is read once per key and shared by the three heads.
+                for (int t = 0; t < tile_len; ++t) {
+                    if (score0[t] == -__builtin_inff() &&
+                        score1[t] == -__builtin_inff() && score2[t] == -__builtin_inff()) continue;
+                    const float p0 = score0[t] == -__builtin_inff() ? 0.0f : exp_neg(score0[t] - m0);
+                    const float p1 = score1[t] == -__builtin_inff() ? 0.0f : exp_neg(score1[t] - m1);
+                    const float p2 = score2[t] == -__builtin_inff() ? 0.0f : exp_neg(score2[t] - m2);
+                    l0 += p0; l1 += p1; l2 += p2;
+
+                    const int64_t kv = kv_base + t;
+                    const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
+                        (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
+                                   kv * vc->nb[2] + kv_head * vc->nb[1]);
+                    const ptrdiff_t v_step = static_cast<ptrdiff_t>(v_trans ? vc->nb[2] : vc->nb[0]);
+                    const vfloat32m2_t v0 = f16_load64(vp, v_step);
+                    const vfloat32m2_t v1 = f16_load64(vp + 64*v_step, v_step);
+                    o00 = __riscv_vfmacc_vf_f32m2(o00, p0, v0, VL);
+                    o01 = __riscv_vfmacc_vf_f32m2(o01, p0, v1, VL);
+                    o10 = __riscv_vfmacc_vf_f32m2(o10, p1, v0, VL);
+                    o11 = __riscv_vfmacc_vf_f32m2(o11, p1, v1, VL);
+                    o20 = __riscv_vfmacc_vf_f32m2(o20, p2, v0, VL);
+                    o21 = __riscv_vfmacc_vf_f32m2(o21, p2, v1, VL);
+                }
             }
             GGML_ASSERT(l0 > 0.0f && l1 > 0.0f && l2 > 0.0f);
             o00 = __riscv_vfmul_vf_f32m2(o00, 1.0f/l0, VL);
