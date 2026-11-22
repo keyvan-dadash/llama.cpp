@@ -1,6 +1,6 @@
 // RVV1024 BQ8 attention: vectorize QK across 64 KV positions.
-// Two queries x three heads share each K column; an odd tail uses three heads.
-// Widening FP16 FMA accumulates six FP32 score vectors; PV and WO are unchanged.
+// Four queries x three heads share each K column; odd tails use the same path.
+// Widening FP16 FMA accumulates up to 12 score vectors; PV runs as two-query pairs.
 {
     // One RVV1024 path: BQ8, K columns and FP16 widening FMA.
         constexpr int BQ = 8;
@@ -28,8 +28,8 @@
         static std::atomic_flag once = ATOMIC_FLAG_INIT;
         if (!once.test_and_set(std::memory_order_relaxed)) {
             std::fprintf(stderr,
-                "[RVV1024] BQ8 KCOL-QK: 2 queries x 3 heads, 64 KV lanes, "
-                "P-vector PV via vrgather.vx + vfmacc.vv\n");
+                "[RVV1024] BQ8 KCOL-QK: 4 queries x 3 heads, 64 KV lanes, "
+                "2-query P-vector PV via vrgather.vx + vfmacc.vv\n");
         }
 
         for (int64_t qb = 0; qb < prepared->ne[1]; qb += BQ) {
@@ -67,25 +67,26 @@
             // KEY OPTIMIZATION: KV-tile-major instead of query-major.
             // Each 64-position KV tile is reused by 8 queries in the same
             // worker, and by both three-Q-head workers sharing a KV head.
-            // The inner register microkernel owns just ONE query's 3 heads;
-            // FP32 (m,l,U) is spilled only once per query per KV tile.
+            // The QK microkernel shares each K column across up to FOUR queries;
+            // the P/V microkernel processes only TWO queries at a time.
             for (int64_t kb = 0; kb < n_kv; kb += BK) {
                 const int len = static_cast<int>(n_kv - kb < BK ? n_kv - kb : BK);
-                for (int t = 0; t < active; t += 2) {
-                    // Six Q-head computations = 3 heads for each of TWO queries,
-                    // not a new six-head ownership partition. K is loaded once
-                    // per position for both queries; V is loaded once per half.
-                    // A single final query uses the same register-P kernel.
-                    const bool has_second = t + 1 < active;
+                for (int t = 0; t < active; t += 4) {
+                    const int nq = active - t < 4 ? active - t : 4;
+                    const bool has_second = nq > 1;
+                    const bool has_third  = nq > 2;
+                    const bool has_fourth = nq > 3;
                     {
-                        // Six weight vectors: one FP32 lane per KV position.
-                        // Keep them in RVV registers through both 64-D PV halves.
+                        // First pair stays in RVV P registers; stage only the
+                        // deferred pair (2 x 3 heads x 64 FP32 = 1.5 KiB).
+                        // This bounds PV register pressure independently of QK.
                         vfloat32m2_t p00, p01, p02, p10, p11, p12;
-                        float alpha[2][H];
+                        alignas(64) float deferred_p[2][H][BK];
+                        float alpha[4][H];
                         {
                             // Vector axis = 64 KV positions, NOT 128 head dimensions.
-                            // The six FP32m2 vectors contain the six score rows.
-                            // Each contiguous K column is shared by all six heads.
+                            // Up to twelve FP32m2 vectors hold QK scores.
+                            // Each K-column load serves up to four queries.
                             // No per-key dot reductions, score exports, or K transpose.
                             const size_t lanes = static_cast<size_t>(len);
                             GGML_ASSERT(len > 0 && len <= 64 && (kb % 64) == 0);
@@ -96,8 +97,10 @@
                             vfloat32m2_t s00 = __riscv_vfmv_v_f_f32m2(0.0f, lanes);
                             vfloat32m2_t s01 = s00, s02 = s00;
                             vfloat32m2_t s10 = s00, s11 = s00, s12 = s00;
-                            // Each dimension loads 64 FP16 K values once.
-                            // Up to six scalar FP16 Q values update six FP32 score vectors.
+                            vfloat32m2_t s20 = s00, s21 = s00, s22 = s00;
+                            vfloat32m2_t s30 = s00, s31 = s00, s32 = s00;
+                            // Load 64 FP16 K values once per dimension, then
+                            // update up to twelve FP32 score vectors.
                             const auto q_half = [&](int qi, int h, int dim) -> _Float16 {
                                 _Float16 val;
                                 __builtin_memcpy(&val, &s.q[t + qi][h][dim], sizeof(val));
@@ -115,6 +118,16 @@
                                     s10 = __riscv_vfwmacc_vf_f32m2(s10, q_half(1, 0, dim), kh, lanes);
                                     s11 = __riscv_vfwmacc_vf_f32m2(s11, q_half(1, 1, dim), kh, lanes);
                                     s12 = __riscv_vfwmacc_vf_f32m2(s12, q_half(1, 2, dim), kh, lanes);
+                                }
+                                if (has_third) {
+                                    s20 = __riscv_vfwmacc_vf_f32m2(s20, q_half(2, 0, dim), kh, lanes);
+                                    s21 = __riscv_vfwmacc_vf_f32m2(s21, q_half(2, 1, dim), kh, lanes);
+                                    s22 = __riscv_vfwmacc_vf_f32m2(s22, q_half(2, 2, dim), kh, lanes);
+                                }
+                                if (has_fourth) {
+                                    s30 = __riscv_vfwmacc_vf_f32m2(s30, q_half(3, 0, dim), kh, lanes);
+                                    s31 = __riscv_vfwmacc_vf_f32m2(s31, q_half(3, 1, dim), kh, lanes);
+                                    s32 = __riscv_vfwmacc_vf_f32m2(s32, q_half(3, 2, dim), kh, lanes);
                                 }
                             }
 
@@ -147,6 +160,18 @@
                                 s10 = scaled(s10, mask1);
                                 s11 = scaled(s11, mask1);
                                 s12 = scaled(s12, mask1);
+                            }
+                            if (has_third) {
+                                const vfloat32m2_t mask2 = mask_row(2);
+                                s20 = scaled(s20, mask2);
+                                s21 = scaled(s21, mask2);
+                                s22 = scaled(s22, mask2);
+                            }
+                            if (has_fourth) {
+                                const vfloat32m2_t mask3 = mask_row(3);
+                                s30 = scaled(s30, mask3);
+                                s31 = scaled(s31, mask3);
+                                s32 = scaled(s32, mask3);
                             }
 
                             // Vector form of the existing exp_neg() polynomial.
@@ -225,63 +250,88 @@
                                 p11 = finalize(1, 1, s11);
                                 p12 = finalize(1, 2, s12);
                             }
+                            if (has_third) {
+                                __riscv_vse32_v_f32m2(deferred_p[0][0], finalize(2, 0, s20), lanes);
+                                __riscv_vse32_v_f32m2(deferred_p[0][1], finalize(2, 1, s21), lanes);
+                                __riscv_vse32_v_f32m2(deferred_p[0][2], finalize(2, 2, s22), lanes);
+                            }
+                            if (has_fourth) {
+                                __riscv_vse32_v_f32m2(deferred_p[1][0], finalize(3, 0, s30), lanes);
+                                __riscv_vse32_v_f32m2(deferred_p[1][1], finalize(3, 1, s31), lanes);
+                                __riscv_vse32_v_f32m2(deferred_p[1][2], finalize(3, 2, s32), lanes);
+                            }
                             if (!any_valid) continue;
                         }
 
-                        // PV phase: one 64-element half of each of six U vectors.
-                        // Six f32m2 accumulators = 12 physical RVV registers;
-                        // V is one f32m2 (2 registers) at a time. The high and
-                        // low halves never have to coexist in registers.
-                        const auto accumulate_half = [&](int dim_offset) {
-                            vfloat32m2_t u00 = __riscv_vle32_v_f32m2(s.accum[t][0] + dim_offset, VL);
-                            vfloat32m2_t u01 = __riscv_vle32_v_f32m2(s.accum[t][1] + dim_offset, VL);
-                            vfloat32m2_t u02 = __riscv_vle32_v_f32m2(s.accum[t][2] + dim_offset, VL);
-                            vfloat32m2_t u10 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + 1][0] + dim_offset, VL) : zero;
-                            vfloat32m2_t u11 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + 1][1] + dim_offset, VL) : zero;
-                            vfloat32m2_t u12 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + 1][2] + dim_offset, VL) : zero;
-                            u00 = __riscv_vfmul_vf_f32m2(u00, alpha[0][0], VL);
-                            u01 = __riscv_vfmul_vf_f32m2(u01, alpha[0][1], VL);
-                            u02 = __riscv_vfmul_vf_f32m2(u02, alpha[0][2], VL);
-                            if (has_second) {
-                                u10 = __riscv_vfmul_vf_f32m2(u10, alpha[1][0], VL);
-                                u11 = __riscv_vfmul_vf_f32m2(u11, alpha[1][1], VL);
-                                u12 = __riscv_vfmul_vf_f32m2(u12, alpha[1][2], VL);
-                            }
-                            for (int j = 0; j < len; ++j) {
-                                const int64_t kv = kb + j;
-                                const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
-                                    (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
-                                               kv * vc->nb[2] + kv_head * vc->nb[1]);
-                                const vfloat32m2_t v = f16_load64(
-                                    vp + dim_offset * v_step, v_step);
-                                // vrgather broadcasts P[j] across 64 output dimensions;
-                                // vector-vector FMA consumes it without extracting a scalar.
-                                u00 = __riscv_vfmacc_vv_f32m2(u00,
-                                    __riscv_vrgather_vx_f32m2(p00, j, VL), v, VL);
-                                u01 = __riscv_vfmacc_vv_f32m2(u01,
-                                    __riscv_vrgather_vx_f32m2(p01, j, VL), v, VL);
-                                u02 = __riscv_vfmacc_vv_f32m2(u02,
-                                    __riscv_vrgather_vx_f32m2(p02, j, VL), v, VL);
+                        // Reuse the same two-query PV kernel twice. First pair
+                        // keeps P in registers; second reloads its staged P.
+                        // Never have twelve P vectors and twelve U vectors live.
+                        for (int pair = 0; pair < nq; pair += 2) {
+                            const bool has_second = pair + 1 < nq;
+                            if (pair != 0) {
+                                const size_t lanes = static_cast<size_t>(len);
+                                p00 = __riscv_vle32_v_f32m2(deferred_p[0][0], lanes);
+                                p01 = __riscv_vle32_v_f32m2(deferred_p[0][1], lanes);
+                                p02 = __riscv_vle32_v_f32m2(deferred_p[0][2], lanes);
                                 if (has_second) {
-                                    u10 = __riscv_vfmacc_vv_f32m2(u10,
-                                        __riscv_vrgather_vx_f32m2(p10, j, VL), v, VL);
-                                    u11 = __riscv_vfmacc_vv_f32m2(u11,
-                                        __riscv_vrgather_vx_f32m2(p11, j, VL), v, VL);
-                                    u12 = __riscv_vfmacc_vv_f32m2(u12,
-                                        __riscv_vrgather_vx_f32m2(p12, j, VL), v, VL);
+                                    p10 = __riscv_vle32_v_f32m2(deferred_p[1][0], lanes);
+                                    p11 = __riscv_vle32_v_f32m2(deferred_p[1][1], lanes);
+                                    p12 = __riscv_vle32_v_f32m2(deferred_p[1][2], lanes);
                                 }
                             }
-                            __riscv_vse32_v_f32m2(s.accum[t][0] + dim_offset, u00, VL);
-                            __riscv_vse32_v_f32m2(s.accum[t][1] + dim_offset, u01, VL);
-                            __riscv_vse32_v_f32m2(s.accum[t][2] + dim_offset, u02, VL);
-                            if (has_second) {
-                                __riscv_vse32_v_f32m2(s.accum[t + 1][0] + dim_offset, u10, VL);
-                                __riscv_vse32_v_f32m2(s.accum[t + 1][1] + dim_offset, u11, VL);
-                                __riscv_vse32_v_f32m2(s.accum[t + 1][2] + dim_offset, u12, VL);
-                            }
-                        };
-                        accumulate_half(0);
-                        accumulate_half(static_cast<int>(VL));
+                            // The PV accumulator operates on at most two
+                            // queries (six heads) regardless of QK group size.
+                            const auto accumulate_half = [&](int dim_offset) {
+                                vfloat32m2_t u00 = __riscv_vle32_v_f32m2(s.accum[t + pair][0] + dim_offset, VL);
+                                vfloat32m2_t u01 = __riscv_vle32_v_f32m2(s.accum[t + pair][1] + dim_offset, VL);
+                                vfloat32m2_t u02 = __riscv_vle32_v_f32m2(s.accum[t + pair][2] + dim_offset, VL);
+                                vfloat32m2_t u10 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + pair + 1][0] + dim_offset, VL) : zero;
+                                vfloat32m2_t u11 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + pair + 1][1] + dim_offset, VL) : zero;
+                                vfloat32m2_t u12 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + pair + 1][2] + dim_offset, VL) : zero;
+                                u00 = __riscv_vfmul_vf_f32m2(u00, alpha[pair][0], VL);
+                                u01 = __riscv_vfmul_vf_f32m2(u01, alpha[pair][1], VL);
+                                u02 = __riscv_vfmul_vf_f32m2(u02, alpha[pair][2], VL);
+                                if (has_second) {
+                                    u10 = __riscv_vfmul_vf_f32m2(u10, alpha[pair + 1][0], VL);
+                                    u11 = __riscv_vfmul_vf_f32m2(u11, alpha[pair + 1][1], VL);
+                                    u12 = __riscv_vfmul_vf_f32m2(u12, alpha[pair + 1][2], VL);
+                                }
+                                for (int j = 0; j < len; ++j) {
+                                    const int64_t kv = kb + j;
+                                    const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
+                                        (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
+                                                   kv * vc->nb[2] + kv_head * vc->nb[1]);
+                                    const vfloat32m2_t v = f16_load64(
+                                        vp + dim_offset * v_step, v_step);
+                                    // vrgather broadcasts P[j] across 64 output dimensions;
+                                    // vector-vector FMA consumes it without extracting a scalar.
+                                    u00 = __riscv_vfmacc_vv_f32m2(u00,
+                                        __riscv_vrgather_vx_f32m2(p00, j, VL), v, VL);
+                                    u01 = __riscv_vfmacc_vv_f32m2(u01,
+                                        __riscv_vrgather_vx_f32m2(p01, j, VL), v, VL);
+                                    u02 = __riscv_vfmacc_vv_f32m2(u02,
+                                        __riscv_vrgather_vx_f32m2(p02, j, VL), v, VL);
+                                    if (has_second) {
+                                        u10 = __riscv_vfmacc_vv_f32m2(u10,
+                                            __riscv_vrgather_vx_f32m2(p10, j, VL), v, VL);
+                                        u11 = __riscv_vfmacc_vv_f32m2(u11,
+                                            __riscv_vrgather_vx_f32m2(p11, j, VL), v, VL);
+                                        u12 = __riscv_vfmacc_vv_f32m2(u12,
+                                            __riscv_vrgather_vx_f32m2(p12, j, VL), v, VL);
+                                    }
+                                }
+                                __riscv_vse32_v_f32m2(s.accum[t + pair][0] + dim_offset, u00, VL);
+                                __riscv_vse32_v_f32m2(s.accum[t + pair][1] + dim_offset, u01, VL);
+                                __riscv_vse32_v_f32m2(s.accum[t + pair][2] + dim_offset, u02, VL);
+                                if (has_second) {
+                                    __riscv_vse32_v_f32m2(s.accum[t + pair + 1][0] + dim_offset, u10, VL);
+                                    __riscv_vse32_v_f32m2(s.accum[t + pair + 1][1] + dim_offset, u11, VL);
+                                    __riscv_vse32_v_f32m2(s.accum[t + pair + 1][2] + dim_offset, u12, VL);
+                                }
+                            };
+                            accumulate_half(0);
+                            accumulate_half(static_cast<int>(VL));
+                        }
                     }
 
                 }
