@@ -45,6 +45,26 @@
             return enabled;
         }();
 
+        // Only the opt-in path uses the producer-side, position-major K cache.
+        // Six QK score vectors remain live: 2 queries x 3 heads x 64 KV lanes.
+        static const bool kcol_qk = [] {
+            const char * e = std::getenv("LLAMA_RVV1024_KCOL_QK");
+            return e && std::strcmp(e, "1") == 0;
+        }();
+        static const bool kcol_qk_verify = [] {
+            const char * e = std::getenv("LLAMA_RVV1024_KCOL_QK_VERIFY");
+            return e && std::strcmp(e, "1") == 0;
+        }();
+        if (kcol_qk) {
+            GGML_ASSERT(pair_queries && kcols &&
+                        "KCOL-QK needs LLAMA_RVV1024_PAIR_QUERIES=1 and K_COLUMNS=1");
+            static std::atomic_flag printed = ATOMIC_FLAG_INIT;
+            if (!printed.test_and_set(std::memory_order_relaxed)) {
+                std::fprintf(stderr, "[RVV1024] KCOL-QK: six FP32 score vectors, "
+                                     "64 KV lanes, zero QK dot reductions\n");
+            }
+        }
+
         for (int64_t qb = 0; qb < prepared->ne[1]; qb += BQ) {
             const int active = static_cast<int>(
                 prepared->ne[1] - qb < BQ ? prepared->ne[1] - qb : BQ);
@@ -89,8 +109,10 @@
             // worker, and by both three-Q-head workers sharing a KV head.
             // The inner register microkernel owns just ONE query's 3 heads;
             // FP32 (m,l,U) is spilled only once per query per KV tile.
-            for (int64_t kb = 0; kb < n_kv; kb += BK) {
-                const int len = static_cast<int>(n_kv - kb < BK ? n_kv - kb : BK);
+            const int kv_step = kcol_qk ? 64 : BK;
+            for (int64_t kb = 0; kb < n_kv; kb += kv_step) {
+                const int len = static_cast<int>(
+                    n_kv - kb < kv_step ? n_kv - kb : kv_step);
                 for (int t = 0; t < active; t += (pair_queries ? 2 : 1)) {
                     // Six Q-head computations = 3 heads for each of TWO queries,
                     // not a new six-head ownership partition. K is loaded once
@@ -98,7 +120,10 @@
                     // Preserve the original 1-query kernel for the A/B control
                     // and the unmatched tail query of an odd token batch.
                     if (pair_queries && t + 1 < active) {
+                        // In the KCOL path, this holds probabilities ONLY.
+                        // Raw QK score vectors never enter addressable scratch.
                         alignas(64) float prob[2][H][BK];
+                        float alpha[2][H];
                         float tile_max[2][H] = {
                             {-__builtin_inff(), -__builtin_inff(), -__builtin_inff()},
                             {-__builtin_inff(), -__builtin_inff(), -__builtin_inff()}
@@ -115,6 +140,153 @@
                                 __riscv_vfwcvt_f_f_v_f32m2(
                                     __riscv_vreinterpret_v_u16m1_f16m1(mh), 1));
                         };
+                        if (kcol_qk) {
+                            // Vector axis = 64 KV positions, NOT 128 head dimensions.
+                            // The six FP32m2 vectors contain the six score rows.
+                            // Each contiguous K column is shared by all six heads.
+                            // No vfredusum, scalar-score stores, or runtime K transpose.
+                            const size_t lanes = static_cast<size_t>(len);
+                            GGML_ASSERT(len > 0 && len <= 64 && (kb % 64) == 0);
+                            const uint8_t * col_base =
+                                static_cast<const uint8_t *>(kcols->data) +
+                                (kb / 64) * kcols->nb[3] + kv_head * kcols->nb[2];
+
+                            vfloat32m2_t s00 = __riscv_vfmv_v_f_f32m2(0.0f, lanes);
+                            vfloat32m2_t s01 = s00, s02 = s00;
+                            vfloat32m2_t s10 = s00, s11 = s00, s12 = s00;
+                            for (int dim = 0; dim < HEAD_DIM; ++dim) {
+                                const uint16_t * kp =
+                                    reinterpret_cast<const uint16_t *>(
+                                        col_base + dim * kcols->nb[1]);
+                                const vfloat16m1_t kh = __riscv_vreinterpret_v_u16m1_f16m1(
+                                    __riscv_vle16_v_u16m1(kp, lanes));
+                                const vfloat32m2_t kf = __riscv_vfwcvt_f_f_v_f32m2(kh, lanes);
+                                s00 = __riscv_vfmacc_vf_f32m2(s00,
+                                    ggml_fp16_to_fp32(s.q[t    ][0][dim]), kf, lanes);
+                                s01 = __riscv_vfmacc_vf_f32m2(s01,
+                                    ggml_fp16_to_fp32(s.q[t    ][1][dim]), kf, lanes);
+                                s02 = __riscv_vfmacc_vf_f32m2(s02,
+                                    ggml_fp16_to_fp32(s.q[t    ][2][dim]), kf, lanes);
+                                s10 = __riscv_vfmacc_vf_f32m2(s10,
+                                    ggml_fp16_to_fp32(s.q[t + 1][0][dim]), kf, lanes);
+                                s11 = __riscv_vfmacc_vf_f32m2(s11,
+                                    ggml_fp16_to_fp32(s.q[t + 1][1][dim]), kf, lanes);
+                                s12 = __riscv_vfmacc_vf_f32m2(s12,
+                                    ggml_fp16_to_fp32(s.q[t + 1][2][dim]), kf, lanes);
+                            }
+
+                            // Add attention scaling and causal masks without
+                            // reducing any individual QK dot product.
+                            const auto mask_row = [&](int qi) -> vfloat32m2_t {
+                                const uint8_t * mp =
+                                    static_cast<const uint8_t *>(mask->data) +
+                                    (qb + t + qi) * mask->nb[1] + kb * mask->nb[0];
+                                if (mask->type == GGML_TYPE_F32) {
+                                    return __riscv_vle32_v_f32m2(
+                                        reinterpret_cast<const float *>(mp), lanes);
+                                }
+                                const vfloat16m1_t mh = __riscv_vreinterpret_v_u16m1_f16m1(
+                                    __riscv_vle16_v_u16m1(
+                                        reinterpret_cast<const uint16_t *>(mp), lanes));
+                                return __riscv_vfwcvt_f_f_v_f32m2(mh, lanes);
+                            };
+                            const vfloat32m2_t mask0 = mask_row(0);
+                            const vfloat32m2_t mask1 = mask_row(1);
+                            const auto scaled = [&](vfloat32m2_t x, vfloat32m2_t m) {
+                                return __riscv_vfadd_vv_f32m2(
+                                    __riscv_vfmul_vf_f32m2(x, ATTN_SCALE, lanes),
+                                    m, lanes);
+                            };
+                            s00 = scaled(s00, mask0);
+                            s01 = scaled(s01, mask0);
+                            s02 = scaled(s02, mask0);
+                            s10 = scaled(s10, mask1);
+                            s11 = scaled(s11, mask1);
+                            s12 = scaled(s12, mask1);
+
+                            const auto score_lane = [&](vfloat32m2_t x, int j) -> float {
+                                return __riscv_vfmv_f_s_f32m2_f32(
+                                    __riscv_vslidedown_vx_f32m2(
+                                        x, static_cast<size_t>(j), 1));
+                            };
+
+                            // Optional one-time numerical test against the
+                            // original contiguous FP16 K cache, including masks.
+                            if (kcol_qk_verify && qb == 0 && t == 0 && kb == 0 && group == 0) {
+                                const auto check = [&](int qi, int h, vfloat32m2_t x) {
+                                    for (int j = 0; j < len; ++j) {
+                                        const float got = score_lane(x, j);
+                                        const float ms = get_mask_score(qb + t + qi, kb + j);
+                                        if (ms == -__builtin_inff()) {
+                                            GGML_ASSERT(got == -__builtin_inff());
+                                            continue;
+                                        }
+                                        const uint8_t * ref_k =
+                                            static_cast<const uint8_t *>(kc->data) +
+                                            (kb + j) * kc->nb[2] + kv_head * kc->nb[1];
+                                        float ref = 0.0f;
+                                        for (int dim = 0; dim < HEAD_DIM; ++dim) {
+                                            const uint16_t kb16 = *reinterpret_cast<const uint16_t *>(
+                                                ref_k + dim * kc->nb[0]);
+                                            ref = __builtin_fmaf(
+                                                ggml_fp16_to_fp32(s.q[t + qi][h][dim]),
+                                                ggml_fp16_to_fp32(kb16), ref);
+                                        }
+                                        ref = ref * ATTN_SCALE + ms;
+                                        GGML_ASSERT(__builtin_isfinite(got) &&
+                                                    __builtin_isfinite(ref) &&
+                                                    __builtin_fabsf(got - ref) <=
+                                                        0.002f + 0.001f * __builtin_fabsf(ref));
+                                    }
+                                };
+                                check(0, 0, s00); check(0, 1, s01); check(0, 2, s02);
+                                check(1, 0, s10); check(1, 1, s11); check(1, 2, s12);
+                                std::fprintf(stderr,
+                                    "[RVV1024] KCOL-QK VERIFY PASS: %d scores checked\n",
+                                    6 * len);
+                            }
+
+                            // Only SIX maximum reductions (not 6*len dot
+                            // reductions). Convert each register-resident
+                            // score row directly to scalar probabilities.
+                            // prob[][][] is then used by the UNCHANGED PV stage.
+                            const auto max_lane = [&](vfloat32m2_t x) -> float {
+                                const vfloat32m1_t seed =
+                                    __riscv_vfmv_v_f_f32m1(-__builtin_inff(), 1);
+                                return __riscv_vfmv_f_s_f32m1_f32(
+                                    __riscv_vfredmax_vs_f32m2_f32m1(x, seed, lanes));
+                            };
+                            bool any_valid = false;
+                            const auto finalize = [&](int qi, int h, vfloat32m2_t scores) {
+                                const float tm = max_lane(scores);
+                                tile_max[qi][h] = tm;
+                                any_valid = any_valid || tm != -__builtin_inff();
+                                const float old_m = s.m[t + qi][h];
+                                float new_m = old_m;
+                                float scale = 1.0f;
+                                float denom = s.l[t + qi][h];
+                                if (tm != -__builtin_inff()) {
+                                    if (tm > new_m) new_m = tm;
+                                    if (denom != 0.0f && new_m > old_m) {
+                                        scale = exp_neg(old_m - new_m);
+                                        denom *= scale;
+                                    }
+                                }
+                                alpha[qi][h] = scale;
+                                s.m[t + qi][h] = new_m;
+                                for (int j = 0; j < len; ++j) {
+                                    const float sc = score_lane(scores, j);
+                                    const float p = sc == -__builtin_inff() ?
+                                        0.0f : exp_neg(sc - new_m);
+                                    prob[qi][h][j] = p;
+                                    denom += p;
+                                }
+                                s.l[t + qi][h] = denom;
+                            };
+                            finalize(0, 0, s00); finalize(0, 1, s01); finalize(0, 2, s02);
+                            finalize(1, 0, s10); finalize(1, 1, s11); finalize(1, 2, s12);
+                            if (!any_valid) continue;
+                        } else {
                         {
                             // QK phase: six Q vectors (12 f16m1 registers) and
                             // two K halves. The U accumulators are NOT live yet.
@@ -205,7 +377,6 @@
                         // Normalize each head's scores to the merged running
                         // maximum and turn score scratch into probabilities.
                         // l and m are updated only ONCE, not per U half.
-                        float alpha[2][H];
                         for (int qi = 0; qi < 2; ++qi) {
                             for (int h = 0; h < H; ++h) {
                                 const float tm = tile_max[qi][h];
@@ -232,6 +403,7 @@
                                 s.l[t + qi][h] = denom;
                             }
                         }
+                        } // legacy head-dimension-vectorized QK
 
                         // PV phase: one 64-element half of each of six U vectors.
                         // Six f32m2 accumulators = 12 physical RVV registers;

@@ -218,6 +218,12 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
 
     auto * k_cache = inp->mctx->get_k(ctx0, il);
     auto * v_cache = inp->mctx->get_v(ctx0, il);
+    // Persistent producer-side K columns, populated by cpy_k() after RoPE.
+    // A view makes the tensor a normal graph source without duplicating it.
+    ggml_tensor * k_columns = inp->mctx->get_k_columns(il);
+    if (k_columns) {
+        k_columns = ggml_view_tensor(ctx0, k_columns);
+    }
 
     // Graph-lifetime storage for the two RoPE scalars. Only the preparation
     // node consumes these parameters; all four fused workers read its output.
@@ -237,19 +243,18 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
             rope_params->op_params);
     ggml_set_name(prepared, "rvv1024_prepared_x_rope");
 
-    // Inputs: shared prepared X/RoPE, packed Wq, Q bias, packed Wo,
-    // K cache, V cache, causal mask, KV-ready dependency (8 sources).
-    // Source [1] and [3] are packed GGUF tensors, not regular Q4_0.
+    // Optional ninth source provides the 64-K-position column cache.
+    // Source [7] depends on its producer, so reads happen after cache writes.
     ggml_tensor * args[] = {
         prepared, layer.wq_rvv1024, layer.wq_b, layer.wo_rvv1024,
-        k_cache, v_cache, inp->self_attn_mask.raw, kv_ready,
+        k_cache, v_cache, inp->self_attn_mask.raw, kv_ready, k_columns,
     };
     // [hidden, tokens, group, 1]. Each three-head group owns one nonoverlapping
     // slab. No atomics or concurrent additions into the final output.
     ggml_tensor * parts = ggml_custom_4d(
             ctx0, GGML_TYPE_F32, n_embd, n_tokens,
             spacemit_kernels::rvv::fused1024::N_Q_GROUPS, 1,
-            args, 8, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, nullptr);
+            args, k_columns ? 9 : 8, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, nullptr);
     ggml_set_name(parts, "rvv1024_partial_y");
 
     // A separate graph node runs after all per-group workers have finished.
