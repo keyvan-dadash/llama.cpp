@@ -55,13 +55,30 @@
             const char * e = std::getenv("LLAMA_RVV1024_KCOL_QK_VERIFY");
             return e && std::strcmp(e, "1") == 0;
         }();
+        // 1: avoid six scalar FP16->FP32 conversions and a vector FP16->FP32
+        // conversion for every head dimension. Use widening FP16 FMA directly.
+        // 0: retain the exact previous KCOL QK arithmetic for A/B testing.
+        static const bool kcol_qk_half_fma = [] {
+            const char * e = std::getenv("LLAMA_RVV1024_KCOL_HALF_FMA");
+            return e && std::strcmp(e, "1") == 0;
+        }();
+        // Diagnostic only: store a whole FP32 score vector to a tiny stack
+        // buffer once, instead of 64 vslidedown+extract operations. This
+        // intentionally loses the register-only score property, so OFF by
+        // default; it isolates the cost of score extraction on the A100.
+        static const bool kcol_qk_score_store = [] {
+            const char * e = std::getenv("LLAMA_RVV1024_KCOL_SCORE_STORE");
+            return e && std::strcmp(e, "1") == 0;
+        }();
         if (kcol_qk) {
             GGML_ASSERT(pair_queries && kcols &&
                         "KCOL-QK needs LLAMA_RVV1024_PAIR_QUERIES=1 and K_COLUMNS=1");
             static std::atomic_flag printed = ATOMIC_FLAG_INIT;
             if (!printed.test_and_set(std::memory_order_relaxed)) {
                 std::fprintf(stderr, "[RVV1024] KCOL-QK: six FP32 score vectors, "
-                                     "64 KV lanes, zero QK dot reductions\n");
+                                     "64 KV lanes, zero QK dot reductions; "
+                                     "half_fma=%d score_store=%d\n",
+                                     int(kcol_qk_half_fma), int(kcol_qk_score_store));
             }
         }
 
@@ -154,25 +171,52 @@
                             vfloat32m2_t s00 = __riscv_vfmv_v_f_f32m2(0.0f, lanes);
                             vfloat32m2_t s01 = s00, s02 = s00;
                             vfloat32m2_t s10 = s00, s11 = s00, s12 = s00;
-                            for (int dim = 0; dim < HEAD_DIM; ++dim) {
-                                const uint16_t * kp =
-                                    reinterpret_cast<const uint16_t *>(
+                            if (kcol_qk_half_fma) {
+                                // Each key column is 64 FP16 elements; each Q
+                                // is a scalar FP16.  vfwmacc.vf performs a
+                                // widened FP16*FP16 -> FP32 accumulation in
+                                // one RVV instruction per score row.
+                                // Use memcpy for bit reinterpretation: s.q is
+                                // uint16_t storage, not an _Float16 array.
+                                const auto q_half = [&](int qi, int h, int dim) -> _Float16 {
+                                    _Float16 val;
+                                    __builtin_memcpy(&val, &s.q[t + qi][h][dim], sizeof(val));
+                                    return val;
+                                };
+                                for (int dim = 0; dim < HEAD_DIM; ++dim) {
+                                    const uint16_t * kp = reinterpret_cast<const uint16_t *>(
                                         col_base + dim * kcols->nb[1]);
-                                const vfloat16m1_t kh = __riscv_vreinterpret_v_u16m1_f16m1(
-                                    __riscv_vle16_v_u16m1(kp, lanes));
-                                const vfloat32m2_t kf = __riscv_vfwcvt_f_f_v_f32m2(kh, lanes);
-                                s00 = __riscv_vfmacc_vf_f32m2(s00,
-                                    ggml_fp16_to_fp32(s.q[t    ][0][dim]), kf, lanes);
-                                s01 = __riscv_vfmacc_vf_f32m2(s01,
-                                    ggml_fp16_to_fp32(s.q[t    ][1][dim]), kf, lanes);
-                                s02 = __riscv_vfmacc_vf_f32m2(s02,
-                                    ggml_fp16_to_fp32(s.q[t    ][2][dim]), kf, lanes);
-                                s10 = __riscv_vfmacc_vf_f32m2(s10,
-                                    ggml_fp16_to_fp32(s.q[t + 1][0][dim]), kf, lanes);
-                                s11 = __riscv_vfmacc_vf_f32m2(s11,
-                                    ggml_fp16_to_fp32(s.q[t + 1][1][dim]), kf, lanes);
-                                s12 = __riscv_vfmacc_vf_f32m2(s12,
-                                    ggml_fp16_to_fp32(s.q[t + 1][2][dim]), kf, lanes);
+                                    const vfloat16m1_t kh = __riscv_vreinterpret_v_u16m1_f16m1(
+                                        __riscv_vle16_v_u16m1(kp, lanes));
+                                    s00 = __riscv_vfwmacc_vf_f32m2(s00, q_half(0, 0, dim), kh, lanes);
+                                    s01 = __riscv_vfwmacc_vf_f32m2(s01, q_half(0, 1, dim), kh, lanes);
+                                    s02 = __riscv_vfwmacc_vf_f32m2(s02, q_half(0, 2, dim), kh, lanes);
+                                    s10 = __riscv_vfwmacc_vf_f32m2(s10, q_half(1, 0, dim), kh, lanes);
+                                    s11 = __riscv_vfwmacc_vf_f32m2(s11, q_half(1, 1, dim), kh, lanes);
+                                    s12 = __riscv_vfwmacc_vf_f32m2(s12, q_half(1, 2, dim), kh, lanes);
+                                }
+                            } else {
+                                // Original KCOL microkernel for isolated A/B.
+                                for (int dim = 0; dim < HEAD_DIM; ++dim) {
+                                    const uint16_t * kp =
+                                        reinterpret_cast<const uint16_t *>(
+                                            col_base + dim * kcols->nb[1]);
+                                    const vfloat16m1_t kh = __riscv_vreinterpret_v_u16m1_f16m1(
+                                        __riscv_vle16_v_u16m1(kp, lanes));
+                                    const vfloat32m2_t kf = __riscv_vfwcvt_f_f_v_f32m2(kh, lanes);
+                                    s00 = __riscv_vfmacc_vf_f32m2(s00,
+                                        ggml_fp16_to_fp32(s.q[t    ][0][dim]), kf, lanes);
+                                    s01 = __riscv_vfmacc_vf_f32m2(s01,
+                                        ggml_fp16_to_fp32(s.q[t    ][1][dim]), kf, lanes);
+                                    s02 = __riscv_vfmacc_vf_f32m2(s02,
+                                        ggml_fp16_to_fp32(s.q[t    ][2][dim]), kf, lanes);
+                                    s10 = __riscv_vfmacc_vf_f32m2(s10,
+                                        ggml_fp16_to_fp32(s.q[t + 1][0][dim]), kf, lanes);
+                                    s11 = __riscv_vfmacc_vf_f32m2(s11,
+                                        ggml_fp16_to_fp32(s.q[t + 1][1][dim]), kf, lanes);
+                                    s12 = __riscv_vfmacc_vf_f32m2(s12,
+                                        ggml_fp16_to_fp32(s.q[t + 1][2][dim]), kf, lanes);
+                                }
                             }
 
                             // Add attention scaling and causal masks without
@@ -241,9 +285,12 @@
                                 };
                                 check(0, 0, s00); check(0, 1, s01); check(0, 2, s02);
                                 check(1, 0, s10); check(1, 1, s11); check(1, 2, s12);
-                                std::fprintf(stderr,
-                                    "[RVV1024] KCOL-QK VERIFY PASS: %d scores checked\n",
-                                    6 * len);
+                                static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+                                if (!reported.test_and_set(std::memory_order_relaxed)) {
+                                    std::fprintf(stderr,
+                                        "[RVV1024] KCOL-QK VERIFY PASS: %d scores checked "
+                                        "(other layers checked silently)\n", 6 * len);
+                                }
                             }
 
                             // Only SIX maximum reductions (not 6*len dot
@@ -274,12 +321,25 @@
                                 }
                                 alpha[qi][h] = scale;
                                 s.m[t + qi][h] = new_m;
-                                for (int j = 0; j < len; ++j) {
-                                    const float sc = score_lane(scores, j);
+                                const auto add_score = [&](int j, float sc) {
                                     const float p = sc == -__builtin_inff() ?
                                         0.0f : exp_neg(sc - new_m);
                                     prob[qi][h][j] = p;
                                     denom += p;
+                                };
+                                if (kcol_qk_score_store) {
+                                    // Experimental score export: 256 bytes per
+                                    // head per tile, for A/B against slides.
+                                    alignas(64) float scores_in_l1[64];
+                                    __riscv_vse32_v_f32m2(scores_in_l1, scores, lanes);
+                                    for (int j = 0; j < len; ++j) {
+                                        add_score(j, scores_in_l1[j]);
+                                    }
+                                } else {
+                                    // Original register-resident score path.
+                                    for (int j = 0; j < len; ++j) {
+                                        add_score(j, score_lane(scores, j));
+                                    }
                                 }
                                 s.l[t + qi][h] = denom;
                             };
