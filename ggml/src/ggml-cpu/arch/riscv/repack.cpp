@@ -1268,10 +1268,12 @@ static inline void ggml_gemm_q4_0_Mx1_q8_0(int n, float * GGML_RESTRICT s, size_
     UNUSED(ncols_interleaved);
     UNUSED(blocklen);
 
-    for (int y = 0; y < nr / 4; y++) {
-        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
-        for (int x = 0; x < nc / ncols_interleaved; x++) {
-            const block<4, ncols_interleaved> * b_ptr = (const block<4, ncols_interleaved> *) vx + (x * nb);
+    // Reuse each repacked output-channel weight tile across all four-token groups.
+    // The Q4-block accumulation order for each output remains unchanged.
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block<4, ncols_interleaved> * b_ptr = (const block<4, ncols_interleaved> *) vx + (x * nb);
+        for (int y = 0; y < nr / 4; y++) {
+            const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
 
             // 4xM Accumulators
             vfloat32m2_t sumf_0 = __riscv_vfmv_v_f_f32m2(0.0f, ncols_interleaved);
