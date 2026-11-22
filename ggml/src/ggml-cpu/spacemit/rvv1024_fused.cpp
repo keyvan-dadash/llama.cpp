@@ -590,6 +590,9 @@ bool prefill_kernel_ready() noexcept {
         __asm__ __volatile__("" : "+m"(q_four));
     };
 
+    // Optional B_Q=8 / B_KV=64 hierarchical fusion; uses project_q_four.
+#include "rvv1024_bq8.inc"
+
     // One pair at a time. The separate graph node already quantized both
     // inputs and prepared both sets of NEOX RoPE coefficients.
     for (int64_t token_pair = 0; token_pair < prepared->ne[1]; token_pair += 2) {
