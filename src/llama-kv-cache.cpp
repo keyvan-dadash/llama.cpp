@@ -1511,8 +1511,9 @@ static void rvv1024_k_columns_store_fn(ggml_tensor * dst, int ith, int nth, void
                 src->data && idxs->data && cols->data && normal->data);
     GGML_ASSERT((src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) &&
                 src->ne[0] == 256 && src->ne[2] == 1);
-    GGML_ASSERT(idxs->type == GGML_TYPE_I32 && idxs->ne[0] == src->ne[1] &&
-                idxs->nb[0] == sizeof(int32_t));
+    // build_input_k_idxs() creates I64 indices (including global stream slots).
+    GGML_ASSERT(idxs->type == GGML_TYPE_I64 && idxs->ne[0] == src->ne[1] &&
+                idxs->nb[0] == sizeof(int64_t));
     GGML_ASSERT(cols->type == GGML_TYPE_F16 && cols->ne[0] == 64 &&
                 cols->ne[1] == 128 && cols->ne[2] == 2 &&
                 cols->nb[0] == sizeof(uint16_t));
@@ -1525,7 +1526,7 @@ static void rvv1024_k_columns_store_fn(ggml_tensor * dst, int ith, int nth, void
     int32_t first_slot = -1;
 
     for (int64_t token = 0; token < src->ne[1]; ++token) {
-        int32_t slot;
+        int64_t slot;
         memcpy(&slot, static_cast<const uint8_t *>(idxs->data) + token * idxs->nb[0],
                sizeof(slot));
         GGML_ASSERT(slot >= 0 && slot / 64 < cols->ne[3] && slot < normal->ne[1]);
