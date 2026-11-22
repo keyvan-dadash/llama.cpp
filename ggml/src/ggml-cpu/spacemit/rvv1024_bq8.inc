@@ -29,7 +29,7 @@
         if (!once.test_and_set(std::memory_order_relaxed)) {
             std::fprintf(stderr,
                 "[RVV1024] BQ8 KCOL-QK: 2 queries x 3 heads, 64 KV lanes, "
-                "widening FP16 FMA, zero per-key dot reductions\n");
+                "P-vector PV via vrgather.vx + vfmacc.vv\n");
         }
 
         for (int64_t qb = 0; qb < prepared->ne[1]; qb += BQ) {
@@ -75,19 +75,18 @@
                     // Six Q-head computations = 3 heads for each of TWO queries,
                     // not a new six-head ownership partition. K is loaded once
                     // per position for both queries; V is loaded once per half.
-                    // Preserve the original 1-query kernel for the A/B control
-                    // and the unmatched tail query of an odd token batch.
+                    // A single final query uses the same register-P kernel.
                     const bool has_second = t + 1 < active;
                     {
-                        // In the KCOL path, this holds probabilities ONLY.
-                        // Raw QK score vectors never enter addressable scratch.
-                        alignas(64) float prob[2][H][BK];
+                        // Six weight vectors: one FP32 lane per KV position.
+                        // Keep them in RVV registers through both 64-D PV halves.
+                        vfloat32m2_t p00, p01, p02, p10, p11, p12;
                         float alpha[2][H];
                         {
                             // Vector axis = 64 KV positions, NOT 128 head dimensions.
                             // The six FP32m2 vectors contain the six score rows.
                             // Each contiguous K column is shared by all six heads.
-                            // No vfredusum, scalar-score stores, or runtime K transpose.
+                            // No per-key dot reductions, score exports, or K transpose.
                             const size_t lanes = static_cast<size_t>(len);
                             GGML_ASSERT(len > 0 && len <= 64 && (kb % 64) == 0);
                             const uint8_t * col_base =
@@ -150,53 +149,81 @@
                                 s12 = scaled(s12, mask1);
                             }
 
-                            const auto score_lane = [&](vfloat32m2_t x, int j) -> float {
-                                return __riscv_vfmv_f_s_f32m2_f32(
-                                    __riscv_vslidedown_vx_f32m2(
-                                        x, static_cast<size_t>(j), 1));
+                            // Vector form of the existing exp_neg() polynomial.
+                            // Inputs are <= 0. A masked (-inf) score becomes zero;
+                            // no probability leaves a vector register.
+                            const auto exp_neg_vector = [&](vfloat32m2_t x) -> vfloat32m2_t {
+                                const vbool16_t keep = __riscv_vmfgt_vf_f32m2_b16(x, -85.0f, lanes);
+                                const vfloat32m2_t safe = __riscv_vfmax_vf_f32m2(x, -85.0f, lanes);
+                                const vfloat32m2_t z = __riscv_vfmul_vf_f32m2(
+                                    safe, 1.4426950408889634f, lanes);
+                                // exp_neg() rounds the negative base-2 exponent
+                                // away from zero; RTZ(z - 0.5) matches that.
+                                const vint32m2_t n = __riscv_vfcvt_rtz_x_f_v_i32m2(
+                                    __riscv_vfsub_vf_f32m2(z, 0.5f, lanes), lanes);
+                                const vfloat32m2_t nf = __riscv_vfcvt_f_x_v_f32m2(n, lanes);
+                                const vfloat32m2_t r = __riscv_vfsub_vv_f32m2(safe,
+                                    __riscv_vfmul_vf_f32m2(nf, 0.6931471805599453f, lanes), lanes);
+                                const auto horner = [&](vfloat32m2_t p, float c) {
+                                    return __riscv_vfadd_vf_f32m2(
+                                        __riscv_vfmul_vv_f32m2(p, r, lanes), c, lanes);
+                                };
+                                vfloat32m2_t p = __riscv_vfmv_v_f_f32m2(1.0f / 5040.0f, lanes);
+                                p = horner(p, 1.0f / 720.0f);
+                                p = horner(p, 1.0f / 120.0f);
+                                p = horner(p, 1.0f / 24.0f);
+                                p = horner(p, 1.0f / 6.0f);
+                                p = horner(p, 0.5f);
+                                p = horner(p, 1.0f);
+                                p = horner(p, 1.0f);
+                                const vint32m2_t pow_bits = __riscv_vsll_vx_i32m2(
+                                    __riscv_vadd_vx_i32m2(n, 127, lanes), 23, lanes);
+                                const vfloat32m2_t pow2 =
+                                    __riscv_vreinterpret_v_i32m2_f32m2(pow_bits);
+                                const vfloat32m2_t result =
+                                    __riscv_vfmul_vv_f32m2(p, pow2, lanes);
+                                return __riscv_vmerge_vvm_f32m2(
+                                    __riscv_vfmv_v_f_f32m2(0.0f, lanes), result, keep, lanes);
                             };
-
-                            // Only SIX maximum reductions (not 6*len dot
-                            // reductions). Convert each register-resident
-                            // score row directly to scalar probabilities.
-                            // prob[][][] is then used by the UNCHANGED PV stage.
                             const auto max_lane = [&](vfloat32m2_t x) -> float {
                                 const vfloat32m1_t seed =
                                     __riscv_vfmv_v_f_f32m1(-__builtin_inff(), 1);
                                 return __riscv_vfmv_f_s_f32m1_f32(
                                     __riscv_vfredmax_vs_f32m2_f32m1(x, seed, lanes));
                             };
+                            const auto sum_lane = [&](vfloat32m2_t x) -> float {
+                                const vfloat32m1_t seed = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+                                return __riscv_vfmv_f_s_f32m1_f32(
+                                    __riscv_vfredusum_vs_f32m2_f32m1(x, seed, lanes));
+                            };
                             bool any_valid = false;
-                            const auto finalize = [&](int qi, int h, vfloat32m2_t scores) {
-                                const float tm = max_lane(scores);
-                                any_valid = any_valid || tm != -__builtin_inff();
-                                const float old_m = s.m[t + qi][h];
-                                float new_m = old_m;
-                                float scale = 1.0f;
-                                float denom = s.l[t + qi][h];
-                                if (tm != -__builtin_inff()) {
-                                    if (tm > new_m) new_m = tm;
-                                    if (denom != 0.0f && new_m > old_m) {
-                                        scale = exp_neg(old_m - new_m);
-                                        denom *= scale;
-                                    }
+                            const auto finalize = [&](int qi, int h, vfloat32m2_t scores)
+                                    -> vfloat32m2_t {
+                                const float tile_max = max_lane(scores);
+                                if (tile_max == -__builtin_inff()) {
+                                    // All 64 keys masked for this query/head.
+                                    alpha[qi][h] = 1.0f;
+                                    return __riscv_vfmv_v_f_f32m2(0.0f, lanes);
                                 }
+                                any_valid = true;
+                                const float old_m = s.m[t + qi][h];
+                                const float new_m = tile_max > old_m ? tile_max : old_m;
+                                const float scale = (s.l[t + qi][h] != 0.0f && new_m > old_m) ?
+                                    exp_neg(old_m - new_m) : 1.0f;
                                 alpha[qi][h] = scale;
                                 s.m[t + qi][h] = new_m;
-                                const auto add_score = [&](int j, float sc) {
-                                    const float p = sc == -__builtin_inff() ?
-                                        0.0f : exp_neg(sc - new_m);
-                                    prob[qi][h][j] = p;
-                                    denom += p;
-                                };
-                                for (int j = 0; j < len; ++j) {
-                                    add_score(j, score_lane(scores, j));
-                                }
-                                s.l[t + qi][h] = denom;
+                                const vfloat32m2_t weights = exp_neg_vector(
+                                    __riscv_vfsub_vf_f32m2(scores, new_m, lanes));
+                                s.l[t + qi][h] = s.l[t + qi][h] * scale + sum_lane(weights);
+                                return weights;
                             };
-                            finalize(0, 0, s00); finalize(0, 1, s01); finalize(0, 2, s02);
+                            p00 = finalize(0, 0, s00);
+                            p01 = finalize(0, 1, s01);
+                            p02 = finalize(0, 2, s02);
                             if (has_second) {
-                                finalize(1, 0, s10); finalize(1, 1, s11); finalize(1, 2, s12);
+                                p10 = finalize(1, 0, s10);
+                                p11 = finalize(1, 1, s11);
+                                p12 = finalize(1, 2, s12);
                             }
                             if (!any_valid) continue;
                         }
@@ -221,26 +248,27 @@
                                 u12 = __riscv_vfmul_vf_f32m2(u12, alpha[1][2], VL);
                             }
                             for (int j = 0; j < len; ++j) {
-                                const float p00 = prob[0][0][j], p01 = prob[0][1][j];
-                                const float p02 = prob[0][2][j];
-                                const float p10 = has_second ? prob[1][0][j] : 0.0f;
-                                const float p11 = has_second ? prob[1][1][j] : 0.0f;
-                                const float p12 = has_second ? prob[1][2][j] : 0.0f;
-                                if (p00 == 0.0f && p01 == 0.0f && p02 == 0.0f &&
-                                    p10 == 0.0f && p11 == 0.0f && p12 == 0.0f) continue;
                                 const int64_t kv = kb + j;
                                 const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
                                     (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
                                                kv * vc->nb[2] + kv_head * vc->nb[1]);
                                 const vfloat32m2_t v = f16_load64(
                                     vp + dim_offset * v_step, v_step);
-                                u00 = __riscv_vfmacc_vf_f32m2(u00, p00, v, VL);
-                                u01 = __riscv_vfmacc_vf_f32m2(u01, p01, v, VL);
-                                u02 = __riscv_vfmacc_vf_f32m2(u02, p02, v, VL);
+                                // vrgather broadcasts P[j] across 64 output dimensions;
+                                // vector-vector FMA consumes it without extracting a scalar.
+                                u00 = __riscv_vfmacc_vv_f32m2(u00,
+                                    __riscv_vrgather_vx_f32m2(p00, j, VL), v, VL);
+                                u01 = __riscv_vfmacc_vv_f32m2(u01,
+                                    __riscv_vrgather_vx_f32m2(p01, j, VL), v, VL);
+                                u02 = __riscv_vfmacc_vv_f32m2(u02,
+                                    __riscv_vrgather_vx_f32m2(p02, j, VL), v, VL);
                                 if (has_second) {
-                                    u10 = __riscv_vfmacc_vf_f32m2(u10, p10, v, VL);
-                                    u11 = __riscv_vfmacc_vf_f32m2(u11, p11, v, VL);
-                                    u12 = __riscv_vfmacc_vf_f32m2(u12, p12, v, VL);
+                                    u10 = __riscv_vfmacc_vv_f32m2(u10,
+                                        __riscv_vrgather_vx_f32m2(p10, j, VL), v, VL);
+                                    u11 = __riscv_vfmacc_vv_f32m2(u11,
+                                        __riscv_vrgather_vx_f32m2(p11, j, VL), v, VL);
+                                    u12 = __riscv_vfmacc_vv_f32m2(u12,
+                                        __riscv_vrgather_vx_f32m2(p12, j, VL), v, VL);
                                 }
                             }
                             __riscv_vse32_v_f32m2(s.accum[t][0] + dim_offset, u00, VL);
