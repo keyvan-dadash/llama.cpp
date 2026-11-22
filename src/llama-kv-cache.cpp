@@ -6,8 +6,11 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -113,7 +116,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(3u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -232,6 +235,21 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
+        // A K-matrix weight repack cannot transpose the *token* axis of its
+        // output.  Instead, allocate a persistent, producer-written companion
+        // cache.  This stays dormant unless the experimental graph requests it.
+        // Normal K remains intact for GGML, state save/restore and fallbacks.
+        ggml_tensor * k_columns = nullptr;
+        const char * kcol_env = getenv("LLAMA_RVV1024_K_COLUMNS");
+        if (kcol_env && strcmp(kcol_env, "1") == 0 &&
+            type_k == GGML_TYPE_F16 && buft == ggml_backend_cpu_buffer_type() &&
+            !other && n_stream == 1 &&
+            hparams.n_embd_head_k(il) == 128 && hparams.n_head_kv(il) == 2) {
+            k_columns = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+                                            64, 128, 2, (kv_size + 63) / 64);
+            ggml_format_name(k_columns, "cache_%skcols_l%d", name_tag, il);
+        }
+
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
 
@@ -246,6 +264,7 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.back().k_columns = k_columns;
     }
 
     if (reuse) {
@@ -1296,6 +1315,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_k_columns(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].k_columns;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1469,6 +1494,80 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
+// An output-channel (W_K) repack cannot transpose the token axis.  Capture
+// each newly projected, RoPE-adjusted (and now FP16) K row at the cache
+// boundary in a persistent key-position-major shadow cache.  Both the normal
+// K cache and this shadow are updated on all cpy_k() paths, including decode.
+static void rvv1024_k_columns_store_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) nth;
+    (void) userdata;
+    if (ith != 0) return;
+
+    const ggml_tensor * src = dst->src[0];    // post-RoPE K [256, n_tokens], often F32
+    const ggml_tensor * idxs = dst->src[1];   // true cache slots per token
+    const ggml_tensor * cols = dst->src[2];   // [64, 128, 2, ceil(kv_size/64)]
+    const ggml_tensor * normal = dst->src[4]; // normal K [256, kv_size, 1]
+    GGML_ASSERT(src && idxs && cols && normal && dst->src[3] &&
+                src->data && idxs->data && cols->data && normal->data);
+    GGML_ASSERT((src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) &&
+                src->ne[0] == 256 && src->ne[2] == 1);
+    GGML_ASSERT(idxs->type == GGML_TYPE_I32 && idxs->ne[0] == src->ne[1] &&
+                idxs->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(cols->type == GGML_TYPE_F16 && cols->ne[0] == 64 &&
+                cols->ne[1] == 128 && cols->ne[2] == 2 &&
+                cols->nb[0] == sizeof(uint16_t));
+    GGML_ASSERT(normal->type == GGML_TYPE_F16 && normal->ne[0] == 256 &&
+                normal->ne[2] == 1 && normal->nb[0] == sizeof(uint16_t));
+
+    const char * e = getenv("LLAMA_RVV1024_K_COLUMNS_VERIFY");
+    const bool verify = e && strcmp(e, "1") == 0;
+    uint64_t verified = 0;
+    int32_t first_slot = -1;
+
+    for (int64_t token = 0; token < src->ne[1]; ++token) {
+        int32_t slot;
+        memcpy(&slot, static_cast<const uint8_t *>(idxs->data) + token * idxs->nb[0],
+               sizeof(slot));
+        GGML_ASSERT(slot >= 0 && slot / 64 < cols->ne[3] && slot < normal->ne[1]);
+        if (first_slot < 0) first_slot = slot;
+        const int64_t block = slot / 64;
+        const int64_t lane  = slot % 64;
+
+        for (int64_t head = 0; head < 2; ++head) {
+            for (int64_t dim = 0; dim < 128; ++dim) {
+                const int64_t feature = head * 128 + dim;
+                // GGML has already rounded Kcur (usually F32) to the
+                // exact FP16 representation stored by its standard cache op.
+                // Copy those *bits* instead of rounding FP32 a second time.
+                const uint8_t * from = static_cast<const uint8_t *>(normal->data) +
+                    slot * normal->nb[1] + feature * normal->nb[0];
+                uint8_t * to = static_cast<uint8_t *>(cols->data) +
+                    block * cols->nb[3] + head * cols->nb[2] +
+                    dim * cols->nb[1] + lane * cols->nb[0];
+                memcpy(to, from, sizeof(uint16_t));
+                if (verify) {
+                    const int64_t flat = ((block * 2 + head) * 128 + dim) * 64 + lane;
+                    const uint8_t * by_flat_offset = static_cast<const uint8_t *>(cols->data) +
+                        flat * sizeof(uint16_t);
+                    GGML_ASSERT(memcmp(to, from, sizeof(uint16_t)) == 0 &&
+                                memcmp(by_flat_offset, from, sizeof(uint16_t)) == 0);
+                    ++verified;
+                }
+            }
+        }
+    }
+    *static_cast<int32_t *>(dst->data) = 0;
+    if (verify && first_slot >= 0) {
+        static std::atomic_flag printed = ATOMIC_FLAG_INIT;
+        if (!printed.test_and_set(std::memory_order_relaxed)) {
+            fprintf(stderr, "[RVV1024] K-columns VERIFY PASS: %llu FP16 entries; "
+                    "first_slot=%d block=%d lane=%d; [64,128,2,blocks]\n",
+                    static_cast<unsigned long long>(verified), first_slot,
+                    first_slot / 64, first_slot % 64);
+        }
+    }
+}
+
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -1501,7 +1600,17 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * normal_store = ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * cols = layers[ikv].k_columns;
+    if (!cols) return normal_store;
+
+    // The normal store must finish before verifying or writing its shadow.
+    // Return this node so *all* graph builders keep it as a dependency.
+    ggml_tensor * args[] = { k_cur, k_idxs, cols, normal_store, layers[ikv].k };
+    ggml_tensor * col_store = ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1,
+                                             args, 5, rvv1024_k_columns_store_fn, 1, nullptr);
+    ggml_set_name(col_store, "rvv1024_store_k_columns");
+    return col_store;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2071,6 +2180,7 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += layer.k_columns ? ggml_nbytes(layer.k_columns) : 0;
     }
 
     return size_k_bytes;
@@ -3049,6 +3159,10 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_columns(int32_t il) const {
+    return kv->get_k_columns(il);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

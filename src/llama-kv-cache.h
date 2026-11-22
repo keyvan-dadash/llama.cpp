@@ -167,6 +167,10 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // Experimental RVV1024 producer-side K layout: [64 KV slots, 128 dimensions,
+    // 2 KV heads, ceil(kv_size/64) blocks]. NULL unless opted in at cache creation.
+    ggml_tensor * get_k_columns(int32_t il) const;
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // The stream holding seq_id's cells.
@@ -270,6 +274,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // Optional, persistent column-oriented FP16 K cache (RVV1024 experiment).
+        ggml_tensor * k_columns = nullptr;
 
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
@@ -418,6 +425,7 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_columns(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
