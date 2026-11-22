@@ -24,6 +24,57 @@
 
 #define UNUSED GGML_UNUSED
 
+#if defined(__riscv_v) && defined(__riscv_zvfh)
+// RVV1024 fast path for the 4-row, interleave-1 Q8_0 activation layout.
+// On VLEN < 1024, fall back to the original exact scalar implementation.
+// Keep the float division and FP16 scale conversion identical to the generic
+// function, and use RMM for roundf-compatible ties-away-from-zero rounding.
+static inline vint8mf4_t ggml_quantize_mat_q8_0_4x1_rvv_row(
+        const float * src, ggml_half * d_out, size_t vl, vfloat32m1_t zero) {
+    const vfloat32m1_t values = __riscv_vle32_v_f32m1(src, vl);
+    const vfloat32m1_t magnitudes = __riscv_vfabs_v_f32m1(values, vl);
+    const vfloat32m1_t max_v = __riscv_vfredmax_vs_f32m1_f32m1(magnitudes, zero, vl);
+    const float amax = __riscv_vfmv_f_s_f32m1_f32(max_v);
+    const float d = amax / 127.0f;
+    *d_out = GGML_CPU_FP32_TO_FP16(d);
+    const float inv = d ? 1.0f / d : 0.0f;
+
+    const vfloat32m1_t scaled = __riscv_vfmul_vf_f32m1(values, inv, vl);
+    // RMM = nearest, ties to max magnitude; exactly roundf() for finite
+    // in-range values. Narrow directly to 16 bits, then to signed 8 bits.
+    const vint16mf2_t q16 = __riscv_vfncvt_x_f_w_i16mf2_rm(scaled, 4, vl);
+    return __riscv_vncvt_x_x_w_i8mf4(q16, vl);
+}
+
+void ggml_quantize_mat_q8_0_4x1(const float * GGML_RESTRICT x,
+                                void * GGML_RESTRICT vy, int64_t k) {
+    assert(QK8_0 == 32);
+    assert(k % QK8_0 == 0);
+
+    const size_t vl = __riscv_vsetvl_e32m1(QK8_0);
+    if (vl != QK8_0) {
+        // This layout requires all 32 values to be live for a segment store.
+        // Avoid silently truncating output on VLEN 128/256/512 machines.
+        ggml_quantize_mat_q8_0_4x1_generic(x, vy, k);
+        return;
+    }
+
+    block_q8_0x4 * GGML_RESTRICT y = (block_q8_0x4 *) vy;
+    const vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    const int64_t nb = k / QK8_0;
+    for (int64_t b = 0; b < nb; ++b) {
+        const size_t base = (size_t) b * QK8_0;
+        block_q8_0x4 * out = &y[b];
+        const vint8mf4_t q0 = ggml_quantize_mat_q8_0_4x1_rvv_row(x + 0 * k + base, &out->d[0], vl, zero);
+        const vint8mf4_t q1 = ggml_quantize_mat_q8_0_4x1_rvv_row(x + 1 * k + base, &out->d[1], vl, zero);
+        const vint8mf4_t q2 = ggml_quantize_mat_q8_0_4x1_rvv_row(x + 2 * k + base, &out->d[2], vl, zero);
+        const vint8mf4_t q3 = ggml_quantize_mat_q8_0_4x1_rvv_row(x + 3 * k + base, &out->d[3], vl, zero);
+        const vint8mf4x4_t packed = __riscv_vcreate_v_i8mf4x4(q0, q1, q2, q3);
+        __riscv_vsseg4e8_v_i8mf4x4(out->qs, packed, vl);
+    }
+}
+#endif // __riscv_v && __riscv_zvfh
+
 void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(QK8_0 == 32);
     assert(k % QK8_0 == 0);
