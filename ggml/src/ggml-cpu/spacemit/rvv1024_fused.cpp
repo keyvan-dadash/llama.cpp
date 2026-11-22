@@ -220,6 +220,31 @@ bool prefill_kernel_ready() noexcept {
                 mask->ne[0] >= n_kv && mask->ne[1] >= prepared->ne[1] &&
                 mask->nb[0] == (mask->type == GGML_TYPE_F16 ? 2u : 4u));
 
+    // Opt-in, print-once observation of the ACTUAL V cache passed by GGML.
+    // Layout may be transposed: RVV then uses strided V gathers (vlse16).
+    // This probe is outside the inner loops and has no output unless enabled.
+    static const bool diagnose_v_layout = [] {
+        const char * e = std::getenv("LLAMA_RVV1024_V_LAYOUT_DIAG");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    if (diagnose_v_layout) {
+        static std::atomic_flag once = ATOMIC_FLAG_INIT;
+        if (!once.test_and_set(std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                "[RVV1024] V layout=%s, v_step=%zu bytes, ne=[%lld,%lld,%lld], "
+                "nb=[%zu,%zu,%zu], n_kv=%lld\n",
+                v_trans ? "TRANSPOSED/STRIDED" : "NORMAL/CONTIGUOUS",
+                static_cast<size_t>(v_trans ? vc->nb[2] : vc->nb[0]),
+                static_cast<long long>(vc->ne[0]),
+                static_cast<long long>(vc->ne[1]),
+                static_cast<long long>(vc->ne[2]),
+                static_cast<size_t>(vc->nb[0]),
+                static_cast<size_t>(vc->nb[1]),
+                static_cast<size_t>(vc->nb[2]),
+                static_cast<long long>(n_kv));
+        }
+    }
+
     const int first_head = static_cast<int>(group_first_q_head(group));
     const int kv_head = static_cast<int>(group_kv_head(group));
 

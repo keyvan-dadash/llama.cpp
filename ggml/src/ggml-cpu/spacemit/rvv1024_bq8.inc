@@ -33,6 +33,18 @@
         const auto zero = __riscv_vfmv_v_f_f32m2(0.0f, VL);
         const ptrdiff_t v_step = static_cast<ptrdiff_t>(v_trans ? vc->nb[2] : vc->nb[0]);
 
+        // Only changes the attention microkernel. Q projection (BQ=8),
+        // W_O and the four three-head worker groups are unchanged.
+        static const bool pair_queries = [] {
+            const char * e = std::getenv("LLAMA_RVV1024_PAIR_QUERIES");
+            const bool enabled = e && std::strcmp(e, "1") == 0;
+            if (enabled) {
+                std::fprintf(stderr,
+                    "[RVV1024] paired attention: 2 queries x 3 heads, split U halves\n");
+            }
+            return enabled;
+        }();
+
         for (int64_t qb = 0; qb < prepared->ne[1]; qb += BQ) {
             const int active = static_cast<int>(
                 prepared->ne[1] - qb < BQ ? prepared->ne[1] - qb : BQ);
@@ -79,7 +91,197 @@
             // FP32 (m,l,U) is spilled only once per query per KV tile.
             for (int64_t kb = 0; kb < n_kv; kb += BK) {
                 const int len = static_cast<int>(n_kv - kb < BK ? n_kv - kb : BK);
-                for (int t = 0; t < active; ++t) {
+                for (int t = 0; t < active; t += (pair_queries ? 2 : 1)) {
+                    // Six Q-head computations = 3 heads for each of TWO queries,
+                    // not a new six-head ownership partition. K is loaded once
+                    // per position for both queries; V is loaded once per half.
+                    // Preserve the original 1-query kernel for the A/B control
+                    // and the unmatched tail query of an odd token batch.
+                    if (pair_queries && t + 1 < active) {
+                        alignas(64) float prob[2][H][BK];
+                        float tile_max[2][H] = {
+                            {-__builtin_inff(), -__builtin_inff(), -__builtin_inff()},
+                            {-__builtin_inff(), -__builtin_inff(), -__builtin_inff()}
+                        };
+                        const auto get_mask_score = [&](int64_t tok, int64_t kv) -> float {
+                            const uint8_t * mp = static_cast<const uint8_t *>(mask->data) +
+                                tok * mask->nb[1] + kv * mask->nb[0];
+                            if (mask->type == GGML_TYPE_F32) {
+                                return *reinterpret_cast<const float *>(mp);
+                            }
+                            const vuint16m1_t mh = __riscv_vle16_v_u16m1(
+                                reinterpret_cast<const uint16_t *>(mp), 1);
+                            return __riscv_vfmv_f_s_f32m2_f32(
+                                __riscv_vfwcvt_f_f_v_f32m2(
+                                    __riscv_vreinterpret_v_u16m1_f16m1(mh), 1));
+                        };
+                        {
+                            // QK phase: six Q vectors (12 f16m1 registers) and
+                            // two K halves. The U accumulators are NOT live yet.
+                            const vfloat16m1_t q000 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t][0], VL));
+                            const vfloat16m1_t q001 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t][0] + VL, VL));
+                            const vfloat16m1_t q010 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t][1], VL));
+                            const vfloat16m1_t q011 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t][1] + VL, VL));
+                            const vfloat16m1_t q020 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t][2], VL));
+                            const vfloat16m1_t q021 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t][2] + VL, VL));
+                            const vfloat16m1_t q100 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t + 1][0], VL));
+                            const vfloat16m1_t q101 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t + 1][0] + VL, VL));
+                            const vfloat16m1_t q110 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t + 1][1], VL));
+                            const vfloat16m1_t q111 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t + 1][1] + VL, VL));
+                            const vfloat16m1_t q120 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t + 1][2], VL));
+                            const vfloat16m1_t q121 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                __riscv_vle16_v_u16m1(s.q[t + 1][2] + VL, VL));
+
+                            const auto dot_score = [&](vfloat16m1_t qlo, vfloat16m1_t qhi,
+                                                        vfloat16m1_t klo, vfloat16m1_t khi,
+                                                        float mask_score) -> float {
+                                return sum64(__riscv_vfwmacc_vv_f32m2(
+                                    __riscv_vfwmul_vv_f32m2(qlo, klo, VL), qhi, khi, VL)) *
+                                    ATTN_SCALE + mask_score;
+                            };
+                            for (int j = 0; j < len; ++j) {
+                                const int64_t kv = kb + j;
+                                const float mask0 = get_mask_score(qb + t, kv);
+                                const float mask1 = get_mask_score(qb + t + 1, kv);
+                                if (mask0 == -__builtin_inff() && mask1 == -__builtin_inff()) {
+                                    for (int h = 0; h < H; ++h) {
+                                        prob[0][h][j] = -__builtin_inff();
+                                        prob[1][h][j] = -__builtin_inff();
+                                    }
+                                    continue;
+                                }
+                                const uint8_t * kp = static_cast<const uint8_t *>(kc->data) +
+                                    kv * kc->nb[2] + kv_head * kc->nb[1];
+                                vfloat16m1_t k0 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                    __riscv_vle16_v_u16m1(
+                                        reinterpret_cast<const uint16_t *>(kp), VL));
+                                const vfloat16m1_t k1 = __riscv_vreinterpret_v_u16m1_f16m1(
+                                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(
+                                        kp + VL * kc->nb[0]), VL));
+                                if (mask0 != -__builtin_inff()) {
+                                    prob[0][0][j] = dot_score(q000, q001, k0, k1, mask0);
+                                    __asm__ __volatile__("" : "+vr"(k0) : "f"(prob[0][0][j]));
+                                    prob[0][1][j] = dot_score(q010, q011, k0, k1, mask0);
+                                    __asm__ __volatile__("" : "+vr"(k0) : "f"(prob[0][1][j]));
+                                    prob[0][2][j] = dot_score(q020, q021, k0, k1, mask0);
+                                } else {
+                                    prob[0][0][j] = prob[0][1][j] = prob[0][2][j] = -__builtin_inff();
+                                }
+                                if (mask1 != -__builtin_inff()) {
+                                    prob[1][0][j] = dot_score(q100, q101, k0, k1, mask1);
+                                    __asm__ __volatile__("" : "+vr"(k0) : "f"(prob[1][0][j]));
+                                    prob[1][1][j] = dot_score(q110, q111, k0, k1, mask1);
+                                    __asm__ __volatile__("" : "+vr"(k0) : "f"(prob[1][1][j]));
+                                    prob[1][2][j] = dot_score(q120, q121, k0, k1, mask1);
+                                } else {
+                                    prob[1][0][j] = prob[1][1][j] = prob[1][2][j] = -__builtin_inff();
+                                }
+                                for (int h = 0; h < H; ++h) {
+                                    if (prob[0][h][j] > tile_max[0][h])
+                                        tile_max[0][h] = prob[0][h][j];
+                                    if (prob[1][h][j] > tile_max[1][h])
+                                        tile_max[1][h] = prob[1][h][j];
+                                }
+                            }
+                        }
+
+                        bool any_valid = false;
+                        for (int qi = 0; qi < 2; ++qi)
+                            for (int h = 0; h < H; ++h)
+                                any_valid = any_valid || tile_max[qi][h] != -__builtin_inff();
+                        if (!any_valid) continue;
+
+                        // Normalize each head's scores to the merged running
+                        // maximum and turn score scratch into probabilities.
+                        // l and m are updated only ONCE, not per U half.
+                        float alpha[2][H];
+                        for (int qi = 0; qi < 2; ++qi) {
+                            for (int h = 0; h < H; ++h) {
+                                const float tm = tile_max[qi][h];
+                                const float old_m = s.m[t + qi][h];
+                                float new_m = old_m;
+                                float scale = 1.0f;
+                                float denom = s.l[t + qi][h];
+                                if (tm != -__builtin_inff()) {
+                                    if (tm > new_m) new_m = tm;
+                                    if (denom != 0.0f && new_m > old_m) {
+                                        scale = exp_neg(old_m - new_m);
+                                        denom *= scale;
+                                    }
+                                }
+                                alpha[qi][h] = scale;
+                                s.m[t + qi][h] = new_m;
+                                for (int j = 0; j < len; ++j) {
+                                    const float score = prob[qi][h][j];
+                                    const float p = score == -__builtin_inff() ?
+                                        0.0f : exp_neg(score - new_m);
+                                    prob[qi][h][j] = p;
+                                    denom += p;
+                                }
+                                s.l[t + qi][h] = denom;
+                            }
+                        }
+
+                        // PV phase: one 64-element half of each of six U vectors.
+                        // Six f32m2 accumulators = 12 physical RVV registers;
+                        // V is one f32m2 (2 registers) at a time. The high and
+                        // low halves never have to coexist in registers.
+                        const auto accumulate_half = [&](int dim_offset) {
+                            vfloat32m2_t u00 = __riscv_vle32_v_f32m2(s.accum[t][0] + dim_offset, VL);
+                            vfloat32m2_t u01 = __riscv_vle32_v_f32m2(s.accum[t][1] + dim_offset, VL);
+                            vfloat32m2_t u02 = __riscv_vle32_v_f32m2(s.accum[t][2] + dim_offset, VL);
+                            vfloat32m2_t u10 = __riscv_vle32_v_f32m2(s.accum[t + 1][0] + dim_offset, VL);
+                            vfloat32m2_t u11 = __riscv_vle32_v_f32m2(s.accum[t + 1][1] + dim_offset, VL);
+                            vfloat32m2_t u12 = __riscv_vle32_v_f32m2(s.accum[t + 1][2] + dim_offset, VL);
+                            u00 = __riscv_vfmul_vf_f32m2(u00, alpha[0][0], VL);
+                            u01 = __riscv_vfmul_vf_f32m2(u01, alpha[0][1], VL);
+                            u02 = __riscv_vfmul_vf_f32m2(u02, alpha[0][2], VL);
+                            u10 = __riscv_vfmul_vf_f32m2(u10, alpha[1][0], VL);
+                            u11 = __riscv_vfmul_vf_f32m2(u11, alpha[1][1], VL);
+                            u12 = __riscv_vfmul_vf_f32m2(u12, alpha[1][2], VL);
+                            for (int j = 0; j < len; ++j) {
+                                const float p00 = prob[0][0][j], p01 = prob[0][1][j];
+                                const float p02 = prob[0][2][j], p10 = prob[1][0][j];
+                                const float p11 = prob[1][1][j], p12 = prob[1][2][j];
+                                if (p00 == 0.0f && p01 == 0.0f && p02 == 0.0f &&
+                                    p10 == 0.0f && p11 == 0.0f && p12 == 0.0f) continue;
+                                const int64_t kv = kb + j;
+                                const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
+                                    (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
+                                               kv * vc->nb[2] + kv_head * vc->nb[1]);
+                                const vfloat32m2_t v = f16_load64(
+                                    vp + dim_offset * v_step, v_step);
+                                u00 = __riscv_vfmacc_vf_f32m2(u00, p00, v, VL);
+                                u01 = __riscv_vfmacc_vf_f32m2(u01, p01, v, VL);
+                                u02 = __riscv_vfmacc_vf_f32m2(u02, p02, v, VL);
+                                u10 = __riscv_vfmacc_vf_f32m2(u10, p10, v, VL);
+                                u11 = __riscv_vfmacc_vf_f32m2(u11, p11, v, VL);
+                                u12 = __riscv_vfmacc_vf_f32m2(u12, p12, v, VL);
+                            }
+                            __riscv_vse32_v_f32m2(s.accum[t][0] + dim_offset, u00, VL);
+                            __riscv_vse32_v_f32m2(s.accum[t][1] + dim_offset, u01, VL);
+                            __riscv_vse32_v_f32m2(s.accum[t][2] + dim_offset, u02, VL);
+                            __riscv_vse32_v_f32m2(s.accum[t + 1][0] + dim_offset, u10, VL);
+                            __riscv_vse32_v_f32m2(s.accum[t + 1][1] + dim_offset, u11, VL);
+                            __riscv_vse32_v_f32m2(s.accum[t + 1][2] + dim_offset, u12, VL);
+                        };
+                        accumulate_half(0);
+                        accumulate_half(static_cast<int>(VL));
+                        continue;
+                    }
+
+                    // One-query fallback: original BQ8 attention body.
                     const int64_t token = qb + t;
                     alignas(64) float score[H][BK];
                     float tile_m0 = -__builtin_inff();
