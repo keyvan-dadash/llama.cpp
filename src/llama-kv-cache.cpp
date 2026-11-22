@@ -240,8 +240,8 @@ llama_kv_cache::llama_kv_cache(
         // cache.  This stays dormant unless the experimental graph requests it.
         // Normal K remains intact for GGML, state save/restore and fallbacks.
         ggml_tensor * k_columns = nullptr;
-        const char * kcol_env = getenv("LLAMA_RVV1024_K_COLUMNS");
-        if (kcol_env && strcmp(kcol_env, "1") == 0 &&
+        const char * graph_env = getenv("LLAMA_RVV1024_GRAPH");
+        if (graph_env && strcmp(graph_env, "1") == 0 &&
             type_k == GGML_TYPE_F16 && buft == ggml_backend_cpu_buffer_type() &&
             !other && n_stream == 1 &&
             hparams.n_embd_head_k(il) == 128 && hparams.n_head_kv(il) == 2) {
@@ -1520,17 +1520,11 @@ static void rvv1024_k_columns_store_fn(ggml_tensor * dst, int ith, int nth, void
     GGML_ASSERT(normal->type == GGML_TYPE_F16 && normal->ne[0] == 256 &&
                 normal->ne[2] == 1 && normal->nb[0] == sizeof(uint16_t));
 
-    const char * e = getenv("LLAMA_RVV1024_K_COLUMNS_VERIFY");
-    const bool verify = e && strcmp(e, "1") == 0;
-    uint64_t verified = 0;
-    int32_t first_slot = -1;
-
     for (int64_t token = 0; token < src->ne[1]; ++token) {
         int64_t slot;
         memcpy(&slot, static_cast<const uint8_t *>(idxs->data) + token * idxs->nb[0],
                sizeof(slot));
         GGML_ASSERT(slot >= 0 && slot / 64 < cols->ne[3] && slot < normal->ne[1]);
-        if (first_slot < 0) first_slot = slot;
         const int64_t block = slot / 64;
         const int64_t lane  = slot % 64;
 
@@ -1546,27 +1540,11 @@ static void rvv1024_k_columns_store_fn(ggml_tensor * dst, int ith, int nth, void
                     block * cols->nb[3] + head * cols->nb[2] +
                     dim * cols->nb[1] + lane * cols->nb[0];
                 memcpy(to, from, sizeof(uint16_t));
-                if (verify) {
-                    const int64_t flat = ((block * 2 + head) * 128 + dim) * 64 + lane;
-                    const uint8_t * by_flat_offset = static_cast<const uint8_t *>(cols->data) +
-                        flat * sizeof(uint16_t);
-                    GGML_ASSERT(memcmp(to, from, sizeof(uint16_t)) == 0 &&
-                                memcmp(by_flat_offset, from, sizeof(uint16_t)) == 0);
-                    ++verified;
-                }
             }
         }
     }
     *static_cast<int32_t *>(dst->data) = 0;
-    if (verify && first_slot >= 0) {
-        static std::atomic_flag printed = ATOMIC_FLAG_INIT;
-        if (!printed.test_and_set(std::memory_order_relaxed)) {
-            fprintf(stderr, "[RVV1024] K-columns VERIFY PASS: %llu FP16 entries; "
-                    "first_slot=%d block=%d lane=%d; [64,128,2,blocks]\n",
-                    static_cast<unsigned long long>(verified), first_slot,
-                    first_slot / 64, first_slot % 64);
-        }
-    }
+
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {

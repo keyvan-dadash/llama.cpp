@@ -221,9 +221,8 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     // Persistent producer-side K columns, populated by cpy_k() after RoPE.
     // A view makes the tensor a normal graph source without duplicating it.
     ggml_tensor * k_columns = inp->mctx->get_k_columns(il);
-    if (k_columns) {
-        k_columns = ggml_view_tensor(ctx0, k_columns);
-    }
+    GGML_ASSERT(k_columns && "RVV1024 graph requires K-column cache");
+    k_columns = ggml_view_tensor(ctx0, k_columns);
 
     // Graph-lifetime storage for the two RoPE scalars. Only the preparation
     // node consumes these parameters; all four fused workers read its output.
@@ -254,7 +253,7 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     ggml_tensor * parts = ggml_custom_4d(
             ctx0, GGML_TYPE_F32, n_embd, n_tokens,
             spacemit_kernels::rvv::fused1024::N_Q_GROUPS, 1,
-            args, k_columns ? 9 : 8, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, nullptr);
+            args, 9, rvv1024_q_attn_wo_fn, GGML_N_TASKS_MAX, nullptr);
     ggml_set_name(parts, "rvv1024_partial_y");
 
     // A separate graph node runs after all per-group workers have finished.
