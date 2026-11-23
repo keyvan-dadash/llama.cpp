@@ -1450,11 +1450,12 @@ static void ggml_gemm_q4_0_64x1_q8_0_8tok(int n, float * GGML_RESTRICT s, size_t
 }
 
 void ggml_gemm_q4_0_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    // Opt-in experiment: compare the baseline against the 8-token path in
-    // one binary. X100 (VLEN 256) and smaller tiles always use baseline.
+    // Default to the faster eight-token GEMM on VLEN1024. For a controlled
+    // A/B comparison, GGML_RVV_Q4_0_GEMM8=0 restores the four-token kernel.
+    // Other vector lengths and short tails still use the original kernel.
     static const bool enable8 = []() {
         const char * v = std::getenv("GGML_RVV_Q4_0_GEMM8");
-        return v && v[0] == '1' && v[1] == '\0';
+        return !(v && v[0] == '0' && v[1] == '\0');
     }();
     if (enable8 && __riscv_vlenb() >= 128 && nr >= 8) {
         ggml_gemm_q4_0_64x1_q8_0_8tok(n, s, bs, vx, vy, nr, nc);

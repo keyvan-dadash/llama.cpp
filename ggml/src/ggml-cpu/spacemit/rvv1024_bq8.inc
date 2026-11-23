@@ -1,7 +1,7 @@
 // RVV1024 BQ8 attention: vectorize QK across 64 KV positions.
 // Four queries x three heads share each K column; odd tails use the same path.
 // Widening FP16 FMA accumulates up to 12 score vectors.
-// PV can use original gather/PV2, scalar-probability/PV2, or scalar-probability/PV4.
+// PV4-only: scalar probabilities with four-query reuse of each V load.
 {
     // One RVV1024 path: BQ8, K columns and FP16 widening FMA.
         constexpr int BQ = 8;
@@ -25,26 +25,13 @@
         const auto zero = __riscv_vfmv_v_f_f32m2(0.0f, VL);
         const ptrdiff_t v_step = static_cast<ptrdiff_t>(v_trans ? vc->nb[2] : vc->nb[0]);
 
-        // Runtime A/B switches, read once per process:
-        //   unset / 0: original 2-query P-vector gather + vfmacc.vv
-        //   2:         2-query scalar P scratch + vfmacc.vf
-        //   4:         4-query scalar P scratch + vfmacc.vf (V reused twice)
-        // All three modes share exactly the same QK, mask, softmax and W_O.
-        static const int pv_mode = []() -> int {
-            const char * mode = std::getenv("LLAMA_RVV1024_PV");
-            if (mode && std::strcmp(mode, "2") == 0) return 2;
-            if (mode && std::strcmp(mode, "4") == 0) return 4;
-            return 0;
-        }();
+        // Always use the four-query scalar-P PV kernel; no runtime mode switch.
 
         GGML_ASSERT(kcols && "RVV1024 requires a K-column cache");
         static std::atomic_flag once = ATOMIC_FLAG_INIT;
         if (!once.test_and_set(std::memory_order_relaxed)) {
             std::fprintf(stderr,
-                "[RVV1024] BQ8 KCOL-QK: 4 queries x 3 heads, 64 KV lanes, %s\n",
-                pv_mode == 0 ? "2-query P-vector PV via vrgather.vx + vfmacc.vv" :
-                pv_mode == 2 ? "PV2 scalar P + vfmacc.vf" :
-                               "PV4 scalar P + vfmacc.vf (4-query V reuse)");
+                "[RVV1024] BQ8 KCOL-QK: 4 queries x 3 heads, 64 KV lanes, PV4 scalar P + vfmacc.vf (4-query V reuse)\n");
         }
 
         for (int64_t qb = 0; qb < prepared->ne[1]; qb += BQ) {
@@ -82,9 +69,8 @@
             // KEY OPTIMIZATION: KV-tile-major instead of query-major.
             // Each 64-position KV tile is reused by 8 queries in the same
             // worker, and by both three-Q-head workers sharing a KV head.
-            // The QK microkernel shares each K column across up to FOUR queries;
-            // PV mode 0/2 processes two queries; PV mode 4 reuses each V load
-            // for all four queries sharing the QK K-column scan.
+            // The QK microkernel shares each K column across up to four queries.
+            // PV4 reuses each V load for all four queries in that group.
             for (int64_t kb = 0; kb < n_kv; kb += BK) {
                 const int len = static_cast<int>(n_kv - kb < BK ? n_kv - kb : BK);
                 for (int t = 0; t < active; t += 4) {
@@ -93,14 +79,10 @@
                     const bool has_third  = nq > 2;
                     const bool has_fourth = nq > 3;
                     {
-                        // First pair stays in RVV P registers; stage only the
-                        // deferred pair (2 x 3 heads x 64 FP32 = 1.5 KiB).
-                        // This bounds PV register pressure independently of QK.
+                        // Keep the first pair of FP32 probabilities in registers
+                        // until QK finishes, then stage them for PV4.
                         vfloat32m2_t p00, p01, p02, p10, p11, p12;
                         alignas(64) float deferred_p[2][H][BK];
-                        // Experimental modes stage the first pair's P as well.
-                        // 6 FP32 probability rows * 64 positions = 1536 bytes.
-                        // The second pair already lives in deferred_p.
                         alignas(64) float first_p[2][H][BK];
                         float alpha[4][H];
                         {
@@ -283,22 +265,19 @@
                             if (!any_valid) continue;
                         }
 
-                        // For scalar-P modes, store the first pair's FP32 P values
-                        // without quantization. The second pair is already
-                        // staged in deferred_p by finalize() above.
-                        if (pv_mode != 0) {
-                            const size_t lanes = static_cast<size_t>(len);
-                            __riscv_vse32_v_f32m2(first_p[0][0], p00, lanes);
-                            __riscv_vse32_v_f32m2(first_p[0][1], p01, lanes);
-                            __riscv_vse32_v_f32m2(first_p[0][2], p02, lanes);
-                            if (has_second) {
-                                __riscv_vse32_v_f32m2(first_p[1][0], p10, lanes);
-                                __riscv_vse32_v_f32m2(first_p[1][1], p11, lanes);
-                                __riscv_vse32_v_f32m2(first_p[1][2], p12, lanes);
-                            }
+                        // PV4 uses scalar FP32 probabilities for both pairs.
+                        // The second pair was already staged in finalize().
+                        const size_t lanes = static_cast<size_t>(len);
+                        __riscv_vse32_v_f32m2(first_p[0][0], p00, lanes);
+                        __riscv_vse32_v_f32m2(first_p[0][1], p01, lanes);
+                        __riscv_vse32_v_f32m2(first_p[0][2], p02, lanes);
+                        if (has_second) {
+                            __riscv_vse32_v_f32m2(first_p[1][0], p10, lanes);
+                            __riscv_vse32_v_f32m2(first_p[1][1], p11, lanes);
+                            __riscv_vse32_v_f32m2(first_p[1][2], p12, lanes);
                         }
 
-                        if (pv_mode == 4) {
+                        {
                             // QK4/PV4: all four queries use the same V load.
                             // Twelve U f32m2 accumulators (24 physical regs)
                             // coexist with one V f32m2 (2 regs), but no P
@@ -381,102 +360,6 @@
                             };
                             accumulate_four_half(0);
                             accumulate_four_half(static_cast<int>(VL));
-                        } else {
-                            // Mode 0: original register-P vrgather PV2.
-                            // Mode 2: scalar P from scratch, vfmacc.vf PV2.
-                            // Both retain the same two-query V reuse.
-
-                            // Reuse the same two-query PV kernel twice. In gather mode,
-                            // first pair keeps P in registers; second reloads P.
-                            // Never have twelve P vectors and twelve U vectors live.
-                            for (int pair = 0; pair < nq; pair += 2) {
-                                const bool has_second = pair + 1 < nq;
-                                if (pair != 0 && pv_mode == 0) {
-                                    const size_t lanes = static_cast<size_t>(len);
-                                    p00 = __riscv_vle32_v_f32m2(deferred_p[0][0], lanes);
-                                    p01 = __riscv_vle32_v_f32m2(deferred_p[0][1], lanes);
-                                    p02 = __riscv_vle32_v_f32m2(deferred_p[0][2], lanes);
-                                    if (has_second) {
-                                        p10 = __riscv_vle32_v_f32m2(deferred_p[1][0], lanes);
-                                        p11 = __riscv_vle32_v_f32m2(deferred_p[1][1], lanes);
-                                        p12 = __riscv_vle32_v_f32m2(deferred_p[1][2], lanes);
-                                    }
-                                }
-                                // The PV accumulator operates on at most two
-                                // queries (six heads) regardless of QK group size.
-                                const auto accumulate_half = [&](int dim_offset) {
-                                    vfloat32m2_t u00 = __riscv_vle32_v_f32m2(s.accum[t + pair][0] + dim_offset, VL);
-                                    vfloat32m2_t u01 = __riscv_vle32_v_f32m2(s.accum[t + pair][1] + dim_offset, VL);
-                                    vfloat32m2_t u02 = __riscv_vle32_v_f32m2(s.accum[t + pair][2] + dim_offset, VL);
-                                    vfloat32m2_t u10 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + pair + 1][0] + dim_offset, VL) : zero;
-                                    vfloat32m2_t u11 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + pair + 1][1] + dim_offset, VL) : zero;
-                                    vfloat32m2_t u12 = has_second ? __riscv_vle32_v_f32m2(s.accum[t + pair + 1][2] + dim_offset, VL) : zero;
-                                    u00 = __riscv_vfmul_vf_f32m2(u00, alpha[pair][0], VL);
-                                    u01 = __riscv_vfmul_vf_f32m2(u01, alpha[pair][1], VL);
-                                    u02 = __riscv_vfmul_vf_f32m2(u02, alpha[pair][2], VL);
-                                    if (has_second) {
-                                        u10 = __riscv_vfmul_vf_f32m2(u10, alpha[pair + 1][0], VL);
-                                        u11 = __riscv_vfmul_vf_f32m2(u11, alpha[pair + 1][1], VL);
-                                        u12 = __riscv_vfmul_vf_f32m2(u12, alpha[pair + 1][2], VL);
-                                    }
-                                    if (pv_mode == 0) {
-                                        for (int j = 0; j < len; ++j) {
-                                            const int64_t kv = kb + j;
-                                            const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
-                                                (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
-                                                           kv * vc->nb[2] + kv_head * vc->nb[1]);
-                                            const vfloat32m2_t v = f16_load64(
-                                                vp + dim_offset * v_step, v_step);
-                                            // vrgather broadcasts P[j] across 64 output dimensions;
-                                            // vector-vector FMA consumes it without extracting a scalar.
-                                            u00 = __riscv_vfmacc_vv_f32m2(u00,
-                                                __riscv_vrgather_vx_f32m2(p00, j, VL), v, VL);
-                                            u01 = __riscv_vfmacc_vv_f32m2(u01,
-                                                __riscv_vrgather_vx_f32m2(p01, j, VL), v, VL);
-                                            u02 = __riscv_vfmacc_vv_f32m2(u02,
-                                                __riscv_vrgather_vx_f32m2(p02, j, VL), v, VL);
-                                            if (has_second) {
-                                                u10 = __riscv_vfmacc_vv_f32m2(u10,
-                                                    __riscv_vrgather_vx_f32m2(p10, j, VL), v, VL);
-                                                u11 = __riscv_vfmacc_vv_f32m2(u11,
-                                                    __riscv_vrgather_vx_f32m2(p11, j, VL), v, VL);
-                                                u12 = __riscv_vfmacc_vv_f32m2(u12,
-                                                    __riscv_vrgather_vx_f32m2(p12, j, VL), v, VL);
-                                            }
-                                        }
-                                    } else {
-                                        const float (*w0)[BK] = pair == 0 ? first_p[0] : deferred_p[0];
-                                        const float (*w1)[BK] = pair == 0 ? first_p[1] : deferred_p[1];
-                                        for (int j = 0; j < len; ++j) {
-                                            const int64_t kv = kb + j;
-                                            const uint8_t * vp = static_cast<const uint8_t *>(vc->data) +
-                                                (v_trans ? kv * vc->nb[0] + kv_head * vc->nb[1] :
-                                                           kv * vc->nb[2] + kv_head * vc->nb[1]);
-                                            const vfloat32m2_t v = f16_load64(
-                                                vp + dim_offset * v_step, v_step);
-                                            u00 = __riscv_vfmacc_vf_f32m2(u00, w0[0][j], v, VL);
-                                            u01 = __riscv_vfmacc_vf_f32m2(u01, w0[1][j], v, VL);
-                                            u02 = __riscv_vfmacc_vf_f32m2(u02, w0[2][j], v, VL);
-                                            if (has_second) {
-                                                u10 = __riscv_vfmacc_vf_f32m2(u10, w1[0][j], v, VL);
-                                                u11 = __riscv_vfmacc_vf_f32m2(u11, w1[1][j], v, VL);
-                                                u12 = __riscv_vfmacc_vf_f32m2(u12, w1[2][j], v, VL);
-                                            }
-                                        }
-                                    }
-                                    __riscv_vse32_v_f32m2(s.accum[t + pair][0] + dim_offset, u00, VL);
-                                    __riscv_vse32_v_f32m2(s.accum[t + pair][1] + dim_offset, u01, VL);
-                                    __riscv_vse32_v_f32m2(s.accum[t + pair][2] + dim_offset, u02, VL);
-                                    if (has_second) {
-                                        __riscv_vse32_v_f32m2(s.accum[t + pair + 1][0] + dim_offset, u10, VL);
-                                        __riscv_vse32_v_f32m2(s.accum[t + pair + 1][1] + dim_offset, u11, VL);
-                                        __riscv_vse32_v_f32m2(s.accum[t + pair + 1][2] + dim_offset, u12, VL);
-                                    }
-                                };
-                                accumulate_half(0);
-                                accumulate_half(static_cast<int>(VL));
-                            }
-
                         }
 
                     }

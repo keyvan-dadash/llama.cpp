@@ -393,18 +393,16 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
-    // resolved after flash attention, see resolve_fused_ops()
-    {
-        cparams.fused_kv_rows = false;
-
-        const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
-        if (!LLAMA_KV_ROWS_DISABLE) {
-            cparams.auto_fkvr = cparams.kv_unified;
-        } else {
-            LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
-            cparams.auto_fkvr = false;
-        }
-    }
+    // The RVV1024 path uses the ordinary KV cache and a separate K-column
+    // view. Disable automatic fused KV-rows selection for RISC-V builds,
+    // matching the previously required LLAMA_KV_ROWS_DISABLE=1 setting.
+    // Leave other architectures' default behaviour unchanged.
+    cparams.fused_kv_rows = false;
+#if defined(__riscv)
+    cparams.auto_fkvr = false;
+#else
+    cparams.auto_fkvr = cparams.kv_unified;
+#endif
 
     // initialized later
     cparams.pipeline_parallel = false;

@@ -241,7 +241,11 @@ llama_kv_cache::llama_kv_cache(
         // Normal K remains intact for GGML, state save/restore and fallbacks.
         ggml_tensor * k_columns = nullptr;
         const char * graph_env = getenv("LLAMA_RVV1024_GRAPH");
-        if (graph_env && strcmp(graph_env, "1") == 0 &&
+        // Keep this in sync with rvv1024_graph_requested(): the fused graph
+        // defaults to enabled, while an explicit GRAPH=0 disables it.
+        // Without this allocation, graph reservation aborts on get_k_columns().
+        const bool graph_requested = !graph_env || strcmp(graph_env, "0") != 0;
+        if (graph_requested &&
             type_k == GGML_TYPE_F16 && buft == ggml_backend_cpu_buffer_type() &&
             !other && n_stream == 1 &&
             hparams.n_embd_head_k(il) == 128 && hparams.n_head_kv(il) == 2) {

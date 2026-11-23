@@ -27,8 +27,10 @@
 namespace {
 
 static bool rvv1024_graph_requested() {
+    // The RVV1024 graph is the default when hardware/model guards pass.
+    // Explicit GRAPH=0 remains available for a normal GGML A/B baseline.
     const char * env = std::getenv("LLAMA_RVV1024_GRAPH");
-    return env != nullptr && std::strcmp(env, "1") == 0;
+    return env == nullptr || std::strcmp(env, "0") != 0;
 }
 
 // Only enable the graph once the CPU backend explicitly reports it can run.
@@ -178,6 +180,13 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
         layer.wqkv || layer.wo_b || layer.wq_s || layer.wk_s || layer.wv_s || layer.wo_s ||
         (il < (int) inp->self_k_rot.size() && inp->self_k_rot[il]) ||
         (il < (int) inp->self_v_rot.size() && inp->self_v_rot[il])) {
+        return nullptr;
+    }
+
+    // A shared, streamed, or otherwise incompatible KV cache might not have
+    // the optional K-column storage. Fall back before creating any K/V graph
+    // nodes instead of aborting later during graph reservation.
+    if (!inp->mctx->get_k_columns(il)) {
         return nullptr;
     }
 
