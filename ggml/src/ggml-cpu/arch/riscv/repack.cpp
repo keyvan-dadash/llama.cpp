@@ -1345,8 +1345,122 @@ void ggml_gemm_q4_0_16x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_gemm_q4_0_32x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     ggml_gemm_q4_0_Mx1_q8_0<32>(n, s, bs, vx, vy, nr, nc);
 }
+// Experimental 8-token path for RVV1024. The existing weight format and
+// 4-token Q8_0 activation blocks are unchanged: each 8-token group reads
+// two successive block_q8_0x4 blocks at every reduction coordinate.
+// Q4 signed nibbles belong to [-8, 7], and quantized Q8 activations belong
+// to [-127, 127]. Therefore each full 32-value dot product fits in i16:
+// abs(sum) <= 32 * 8 * 127 = 32512 < 32767.
+// This bound is not valid for arbitrary q8 input containing -128.
+__attribute__((noinline))
+static void ggml_gemm_q4_0_64x1_q8_0_8tok(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n % QK8_0 == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 64 == 0);
+
+    constexpr size_t vl = 64;
+    const int nb = n / QK8_0;
+    const int nr8 = nr - nr % 8;
+    const block_q8_0x4 * GGML_RESTRICT a = (const block_q8_0x4 *) vy;
+    const block<4, 64> * GGML_RESTRICT b = (const block<4, 64> *) vx;
+
+    // Weight tiles remain outermost, as in the optimized 4-token baseline.
+    for (int x = 0; x < nc / 64; ++x) {
+        const block<4, 64> * b_ptr = b + x * nb;
+        for (int y = 0; y < nr8 / 8; ++y) {
+            const block_q8_0x4 * a_ptr0 = a + (2 * y) * nb;
+            const block_q8_0x4 * a_ptr1 = a_ptr0 + nb;
+            vfloat32m2_t f0 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+            vfloat32m2_t f1 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+            vfloat32m2_t f2 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+            vfloat32m2_t f3 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+            vfloat32m2_t f4 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+            vfloat32m2_t f5 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+            vfloat32m2_t f6 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+            vfloat32m2_t f7 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+
+            for (int l = 0; l < nb; ++l) {
+                vint16m1_t i0 = __riscv_vmv_v_x_i16m1(0, vl);
+                vint16m1_t i1 = __riscv_vmv_v_x_i16m1(0, vl);
+                vint16m1_t i2 = __riscv_vmv_v_x_i16m1(0, vl);
+                vint16m1_t i3 = __riscv_vmv_v_x_i16m1(0, vl);
+                vint16m1_t i4 = __riscv_vmv_v_x_i16m1(0, vl);
+                vint16m1_t i5 = __riscv_vmv_v_x_i16m1(0, vl);
+                vint16m1_t i6 = __riscv_vmv_v_x_i16m1(0, vl);
+                vint16m1_t i7 = __riscv_vmv_v_x_i16m1(0, vl);
+
+                for (int j = 0; j < QK4_0 / 2; ++j) {
+                    const vint8mf2_t packed = __riscv_vle8_v_i8mf2((const int8_t *)&b_ptr[l].qs[j * 64], vl);
+                    const vint8mf2_t lo = __riscv_vsra_vx_i8mf2(__riscv_vsll_vx_i8mf2(packed, 4, vl), 4, vl);
+                    const vint8mf2_t hi = __riscv_vsra_vx_i8mf2(packed, 4, vl);
+                    i0 = __riscv_vwmacc_vx_i16m1(i0, a_ptr0[l].qs[j * 4 + 0], lo, vl);
+                    i1 = __riscv_vwmacc_vx_i16m1(i1, a_ptr0[l].qs[j * 4 + 1], lo, vl);
+                    i2 = __riscv_vwmacc_vx_i16m1(i2, a_ptr0[l].qs[j * 4 + 2], lo, vl);
+                    i3 = __riscv_vwmacc_vx_i16m1(i3, a_ptr0[l].qs[j * 4 + 3], lo, vl);
+                    i4 = __riscv_vwmacc_vx_i16m1(i4, a_ptr1[l].qs[j * 4 + 0], lo, vl);
+                    i5 = __riscv_vwmacc_vx_i16m1(i5, a_ptr1[l].qs[j * 4 + 1], lo, vl);
+                    i6 = __riscv_vwmacc_vx_i16m1(i6, a_ptr1[l].qs[j * 4 + 2], lo, vl);
+                    i7 = __riscv_vwmacc_vx_i16m1(i7, a_ptr1[l].qs[j * 4 + 3], lo, vl);
+                    i0 = __riscv_vwmacc_vx_i16m1(i0, a_ptr0[l].qs[64 + j * 4 + 0], hi, vl);
+                    i1 = __riscv_vwmacc_vx_i16m1(i1, a_ptr0[l].qs[64 + j * 4 + 1], hi, vl);
+                    i2 = __riscv_vwmacc_vx_i16m1(i2, a_ptr0[l].qs[64 + j * 4 + 2], hi, vl);
+                    i3 = __riscv_vwmacc_vx_i16m1(i3, a_ptr0[l].qs[64 + j * 4 + 3], hi, vl);
+                    i4 = __riscv_vwmacc_vx_i16m1(i4, a_ptr1[l].qs[64 + j * 4 + 0], hi, vl);
+                    i5 = __riscv_vwmacc_vx_i16m1(i5, a_ptr1[l].qs[64 + j * 4 + 1], hi, vl);
+                    i6 = __riscv_vwmacc_vx_i16m1(i6, a_ptr1[l].qs[64 + j * 4 + 2], hi, vl);
+                    i7 = __riscv_vwmacc_vx_i16m1(i7, a_ptr1[l].qs[64 + j * 4 + 3], hi, vl);
+                }
+
+                const vfloat16m1_t b_d = __riscv_vle16_v_f16m1((const _Float16 *)b_ptr[l].d, vl);
+                const vfloat32m2_t d0 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr0[l].d[0], vl);
+                f0 = __riscv_vfmacc_vv_f32m2(f0, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i0, vl), vl), d0, vl);
+                const vfloat32m2_t d1 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr0[l].d[1], vl);
+                f1 = __riscv_vfmacc_vv_f32m2(f1, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i1, vl), vl), d1, vl);
+                const vfloat32m2_t d2 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr0[l].d[2], vl);
+                f2 = __riscv_vfmacc_vv_f32m2(f2, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i2, vl), vl), d2, vl);
+                const vfloat32m2_t d3 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr0[l].d[3], vl);
+                f3 = __riscv_vfmacc_vv_f32m2(f3, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i3, vl), vl), d3, vl);
+                const vfloat32m2_t d4 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr1[l].d[0], vl);
+                f4 = __riscv_vfmacc_vv_f32m2(f4, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i4, vl), vl), d4, vl);
+                const vfloat32m2_t d5 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr1[l].d[1], vl);
+                f5 = __riscv_vfmacc_vv_f32m2(f5, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i5, vl), vl), d5, vl);
+                const vfloat32m2_t d6 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr1[l].d[2], vl);
+                f6 = __riscv_vfmacc_vv_f32m2(f6, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i6, vl), vl), d6, vl);
+                const vfloat32m2_t d7 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr1[l].d[3], vl);
+                f7 = __riscv_vfmacc_vv_f32m2(f7, __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(i7, vl), vl), d7, vl);
+            }
+            __riscv_vse32_v_f32m2(s + ((8 * y + 0) * bs) + x * 64, f0, vl);
+            __riscv_vse32_v_f32m2(s + ((8 * y + 1) * bs) + x * 64, f1, vl);
+            __riscv_vse32_v_f32m2(s + ((8 * y + 2) * bs) + x * 64, f2, vl);
+            __riscv_vse32_v_f32m2(s + ((8 * y + 3) * bs) + x * 64, f3, vl);
+            __riscv_vse32_v_f32m2(s + ((8 * y + 4) * bs) + x * 64, f4, vl);
+            __riscv_vse32_v_f32m2(s + ((8 * y + 5) * bs) + x * 64, f5, vl);
+            __riscv_vse32_v_f32m2(s + ((8 * y + 6) * bs) + x * 64, f6, vl);
+            __riscv_vse32_v_f32m2(s + ((8 * y + 7) * bs) + x * 64, f7, vl);
+        }
+    }
+
+    // Four-token tail: use the original kernel, including its independent
+    // i16 low/high accumulators (safe even for q8 input containing -128).
+    if (nr8 != nr) {
+        ggml_gemm_q4_0_Mx1_q8_0<64>(n, s + (size_t) nr8 * bs, bs, vx,
+                a + (nr8 / 4) * nb, nr - nr8, nc);
+    }
+}
+
 void ggml_gemm_q4_0_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    ggml_gemm_q4_0_Mx1_q8_0<64>(n, s, bs, vx, vy, nr, nc);
+    // Opt-in experiment: compare the baseline against the 8-token path in
+    // one binary. X100 (VLEN 256) and smaller tiles always use baseline.
+    static const bool enable8 = []() {
+        const char * v = std::getenv("GGML_RVV_Q4_0_GEMM8");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (enable8 && __riscv_vlenb() >= 128 && nr >= 8) {
+        ggml_gemm_q4_0_64x1_q8_0_8tok(n, s, bs, vx, vy, nr, nc);
+    } else {
+        ggml_gemm_q4_0_Mx1_q8_0<64>(n, s, bs, vx, vy, nr, nc);
+    }
 }
 
 template<int ncols_interleaved>
