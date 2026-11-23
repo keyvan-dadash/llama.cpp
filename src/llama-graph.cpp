@@ -19,6 +19,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -2998,7 +2999,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * k_store_ready) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3039,6 +3041,28 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        }
+        // A/B: standalone FlashAttention reads the same persistent K columns
+        // that the RVV1024 fused graph uses. src[6] = column data, src[7] =
+        // completed K-store token, enforcing writer-before-reader order.
+        // Projection, mask/softmax, P*V and W_O remain ordinary GGML ops.
+        const char * graph_mode = std::getenv("LLAMA_RVV1024_GRAPH");
+        const char * col_mode = std::getenv("GGML_RVV_FA_KCOL");
+        const char * qk_mode = std::getenv("GGML_RVV_FA_QK_F16");
+        if (arch == LLM_ARCH_QWEN2 && mctx && k_store_ready &&
+            graph_mode && std::strcmp(graph_mode, "0") == 0 &&
+            col_mode && std::strcmp(col_mode, "1") == 0 &&
+            qk_mode && std::strcmp(qk_mode, "1") == 0 &&
+            !cparams.training && !kv_rows &&
+            q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+            q->ne[0] == 128 && k->ne[0] == 128 &&
+            q->ne[1] >= 64 && q->ne[2] == 12 && k->ne[2] == 2 &&
+            q->ne[3] == 1 && k->ne[3] == 1) {
+            ggml_tensor * cols = static_cast<const llama_kv_cache_context *>(mctx)->get_k_columns(il);
+            if (cols) {
+                cur->src[6] = ggml_view_tensor(ctx0, cols);
+                cur->src[7] = k_store_ready;
+            }
         }
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
@@ -3289,6 +3313,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k;
     ggml_tensor * v;
+    ggml_tensor * k_store_ready = nullptr;
 
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
@@ -3300,7 +3325,8 @@ ggml_tensor * llm_graph_context::build_attn(
             const auto & k_idxs = inp->get_k_idxs();
             const auto & v_idxs = inp->get_v_idxs();
 
-            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            k_store_ready = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+            ggml_build_forward_expand(gf, k_store_ready);
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
         }
 
@@ -3311,7 +3337,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, k_store_ready);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot[il]) {

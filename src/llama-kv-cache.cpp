@@ -245,7 +245,11 @@ llama_kv_cache::llama_kv_cache(
         // defaults to enabled, while an explicit GRAPH=0 disables it.
         // Without this allocation, graph reservation aborts on get_k_columns().
         const bool graph_requested = !graph_env || strcmp(graph_env, "0") != 0;
-        if (graph_requested &&
+        // Non-fused FlashAttention can share the fused kernel's producer-side
+        // FP16 K-column cache without enabling Q/attention/W_O graph fusion.
+        const char * fa_env = getenv("GGML_RVV_FA_KCOL");
+        const bool fa_kcol_requested = fa_env && strcmp(fa_env, "1") == 0;
+        if ((graph_requested || fa_kcol_requested) &&
             type_k == GGML_TYPE_F16 && buft == ggml_backend_cpu_buffer_type() &&
             !other && n_stream == 1 &&
             hparams.n_embd_head_k(il) == 128 && hparams.n_head_kv(il) == 2) {
