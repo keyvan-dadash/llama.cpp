@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <cstdlib> // for std::getenv
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
@@ -5365,6 +5366,8 @@ template <> void gemm<block_mxfp4, 1, 64, GGML_TYPE_Q8_0>(int n, float * s, size
 }
 #endif
 
+#include "rvv1024_q6_k_repack.inc"
+
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
@@ -5805,6 +5808,11 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 1, 32, GGML_TYPE_Q8_0> q4_0_32x1_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 1, 64, GGML_TYPE_Q8_0> q4_0_64x1_q8_0;
 
+#if defined(__riscv_v)
+    // Experimental, byte-preserving Q6_K output projection repack.
+    static const ggml::cpu::repack::tensor_traits<block_q6_K, 1, 64, GGML_TYPE_Q8_K> q6_K_64x1_q8_K;
+#endif
+
     // Q8_0
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 1, 8, GGML_TYPE_Q8_0> q8_0_8x1_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 1, 16, GGML_TYPE_Q8_0> q8_0_16x1_q8_0;
@@ -5946,6 +5954,15 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             #endif
         }
     } else if (cur->type == GGML_TYPE_Q6_K) {
+#if defined(__riscv_v) && defined(__riscv_zvfh)
+        // Read once: the physical weight layout must not change after loading.
+        static const bool enable_q6k = ggml::cpu::repack::q6k_repack_env("GGML_RVV1024_Q6_K_REPACK");
+        if (enable_q6k && ggml_cpu_has_riscv_v() && __riscv_vlenb() == 128 &&
+                std::strcmp(cur->name, "output.weight") == 0 &&
+                ggml_n_dims(cur) == 2 && cur->ne[0] % QK_K == 0 && cur->ne[1] % 64 == 0) {
+            return &q6_K_64x1_q8_K;
+        }
+#endif
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             if (cur->ne[1] % 8 == 0) {
                 return &q6_K_8x8_q8_K;
