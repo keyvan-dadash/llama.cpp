@@ -369,6 +369,9 @@ bool prefill_kernel_ready() noexcept {
 }
 #endif // standard RVV available
 
+// New single-token path. Existing BQ8 prefill implementation is unchanged.
+#include "rvv1024_decode6_split4.inc"
+
 void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata) {
     GGML_ASSERT(parts && parts->data &&
                 parts->type == GGML_TYPE_F32 && ggml_is_contiguous(parts) &&

@@ -33,6 +33,12 @@ static bool rvv1024_graph_requested() {
     return env == nullptr || std::strcmp(env, "0") != 0;
 }
 
+// Decode6 is strictly opt-in; all multi-token prefill is unchanged.
+static bool rvv1024_decode6_requested() {
+    const char * env = std::getenv("GGML_RVV1024_DECODE6");
+    return env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "4") == 0);
+}
+
 // Only enable the graph once the CPU backend explicitly reports it can run.
 // Registry lookup avoids hard-linking llama to an optional ggml-cpu symbol.
 static ggml_backend_reg_t rvv1024_cpu_reg() {
@@ -128,6 +134,25 @@ static void rvv1024_q_attn_wo_fn(ggml_tensor * parts, int ith, int nth, void * u
     forward(parts, ith, nth, userdata);
 }
 
+// All decode6 custom GGML nodes dispatch via the optional CPU backend.
+static void rvv1024_decode6_dispatch(const char * proc, ggml_tensor * out,
+                                      int ith, int nth, void * userdata) {
+    const auto reg = rvv1024_cpu_reg();
+    const auto forward = reg ? reinterpret_cast<spacemit_kernels::rvv::fused1024::prefill_forward_fn>(
+        ggml_backend_reg_get_proc_address(reg, proc)) : nullptr;
+    if (!forward) GGML_ABORT("RVV1024 decode6 split4 backend procedure unavailable");
+    forward(out, ith, nth, userdata);
+}
+static void rvv1024_decode6_q_fn(ggml_tensor * out, int ith, int nth, void * userdata) {
+    rvv1024_decode6_dispatch(spacemit_kernels::rvv::fused1024::DECODE6_Q_PROC, out, ith, nth, userdata);
+}
+static void rvv1024_decode6_attention_fn(ggml_tensor * out, int ith, int nth, void * userdata) {
+    rvv1024_decode6_dispatch(spacemit_kernels::rvv::fused1024::DECODE6_ATTN_PROC, out, ith, nth, userdata);
+}
+static void rvv1024_decode6_wo_fn(ggml_tensor * out, int ith, int nth, void * userdata) {
+    rvv1024_decode6_dispatch(spacemit_kernels::rvv::fused1024::DECODE6_WO_PROC, out, ith, nth, userdata);
+}
+
 static void rvv1024_reduce_partials_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
     (void) userdata;
     const ggml_tensor * parts = dst->src[0];
@@ -159,7 +184,8 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     // model-lifetime packed I8 Q/W_O tensors. K/V uses GGML for now.
     if (n_embd != 1536 || n_head != 12 || n_head_kv != 2 ||
         n_embd_head_k != 128 || n_embd_head_v != 128 || n_rot != 128 ||
-        n_tokens <= 1 || ubatch.n_seqs_unq != 1 || cparams.training ||
+        (n_tokens <= 1 && !(n_tokens == 1 && rvv1024_decode6_requested())) ||
+        ubatch.n_seqs_unq != 1 || cparams.training ||
         !cparams.causal_attn || rope_type != GGML_ROPE_TYPE_NEOX ||
         ext_factor != 0.0f || attn_factor != 1.0f ||
         !std::isfinite(freq_base) || freq_base <= 0.0f ||
@@ -188,6 +214,16 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     // nodes instead of aborting later during graph reservation.
     if (!inp->mctx->get_k_columns(il)) {
         return nullptr;
+    }
+
+    if (n_tokens == 1) {
+        const auto reg = rvv1024_cpu_reg();
+        using namespace spacemit_kernels::rvv::fused1024;
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, DECODE6_Q_PROC) ||
+            !ggml_backend_reg_get_proc_address(reg, DECODE6_ATTN_PROC) ||
+            !ggml_backend_reg_get_proc_address(reg, DECODE6_WO_PROC)) {
+            return nullptr;
+        }
     }
 
     // K/V construction deliberately uses original GGML ops for now. Keeping
@@ -250,6 +286,43 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
             prepare_args, 2, rvv1024_prepare_x_rope_fn, GGML_N_TASKS_MAX,
             rope_params->op_params);
     ggml_set_name(prepared, "rvv1024_prepared_x_rope");
+
+    if (n_tokens == 1) {
+        using namespace spacemit_kernels::rvv::fused1024;
+        // Four three-head packed W_Q shards, each executed exactly once.
+        ggml_tensor * q_args[] = { prepared, layer.wq_rvv1024, layer.wq_b };
+        ggml_tensor * q = ggml_custom_4d(ctx0, GGML_TYPE_F16,
+            HEAD_DIM, N_Q_HEADS, 1, 1,
+            q_args, 3, rvv1024_decode6_q_fn, GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(q, "rvv1024_decode6_q");
+
+        // Four workers: [KV0 first half, KV0 second half, KV1 first, KV1 second].
+        // Each returns SIX [U(128), m, l] states for later stable merging.
+        ggml_tensor * attn_args[] = { q, k_cache, v_cache,
+                                     inp->self_attn_mask.raw, kv_ready, k_columns };
+        ggml_tensor * stats = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+            DECODE6_STATE_STRIDE, N_Q_HEADS / N_KV_HEADS, DECODE6_WORKERS, 1,
+            attn_args, 6, rvv1024_decode6_attention_fn, GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(stats, "rvv1024_decode6_split_kv_stats");
+
+        // Stable merge happens BEFORE W_O. Four workers each use ONE of the
+        // original packed three-head W_O shards, writing disjoint FP32 slabs.
+        ggml_tensor * wo_args[] = { stats, layer.wo_rvv1024 };
+        ggml_tensor * parts = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+            n_embd, 1, N_Q_GROUPS, 1,
+            wo_args, 2, rvv1024_decode6_wo_fn, GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(parts, "rvv1024_decode6_partial_y");
+
+        // Reuse the unchanged four-slab partial-Y reduction node.
+        ggml_tensor * red_args[] = { parts };
+        ggml_tensor * y = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+            n_embd, 1, 1, 1, red_args, 1, rvv1024_reduce_partials_fn,
+            GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(y, "rvv1024_decode6_attn_out");
+        cb(y, "rvv1024_decode6_attn_out", il);
+        ggml_build_forward_expand(gf, y);
+        return y;
+    }
 
     // Optional ninth source provides the 64-K-position column cache.
     // Source [7] depends on its producer, so reads happen after cache writes.

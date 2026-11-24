@@ -90,6 +90,11 @@ inline constexpr int64_t group_kv_head(int group) {
 // CPU backend extension procedure names, resolved from the GGML CPU registry.
 inline constexpr const char * READY_PROC = "ggml_cpu_rvv1024_prefill_ready";
 inline constexpr const char * FORWARD_PROC = "ggml_cpu_rvv1024_prefill_forward";
+inline constexpr const char * DECODE6_Q_PROC = "ggml_cpu_rvv1024_decode6_split4_q";
+inline constexpr const char * DECODE6_ATTN_PROC = "ggml_cpu_rvv1024_decode6_split4_attn";
+inline constexpr const char * DECODE6_WO_PROC = "ggml_cpu_rvv1024_decode6_split4_wo";
+inline constexpr int DECODE6_WORKERS = 4;
+inline constexpr int DECODE6_STATE_STRIDE = HEAD_DIM + 16; // U[128], m, l, 64B row padding
 using prefill_ready_fn = bool (*)();
 using prefill_forward_fn = void (*)(ggml_tensor * parts, int ith, int nth, void * userdata);
 
@@ -141,5 +146,8 @@ bool prefill_kernel_ready() noexcept;
 // userdata points to a graph-lifetime prefill_rope_config byte sequence.
 // No TCM, DMA, IME, or additional worker threads are involved.
 void forward_q_attn_wo(ggml_tensor * parts, int ith, int nth, void * userdata);
+void forward_decode6_q(ggml_tensor * q, int ith, int nth, void * userdata);
+void forward_decode6_attention(ggml_tensor * stats, int ith, int nth, void * userdata);
+void forward_decode6_wo(ggml_tensor * parts, int ith, int nth, void * userdata);
 
 } // namespace spacemit_kernels::rvv::fused1024

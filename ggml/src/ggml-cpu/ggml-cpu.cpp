@@ -668,6 +668,15 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, rvv1024::FORWARD_PROC) == 0) {
         return (void *) rvv1024::forward_q_attn_wo;
     }
+    if (strcmp(name, rvv1024::DECODE6_Q_PROC) == 0) {
+        return (void *) rvv1024::forward_decode6_q;
+    }
+    if (strcmp(name, rvv1024::DECODE6_ATTN_PROC) == 0) {
+        return (void *) rvv1024::forward_decode6_attention;
+    }
+    if (strcmp(name, rvv1024::DECODE6_WO_PROC) == 0) {
+        return (void *) rvv1024::forward_decode6_wo;
+    }
 #endif
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
