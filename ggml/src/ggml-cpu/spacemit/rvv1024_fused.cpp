@@ -1,4 +1,5 @@
 #include "rvv1024_fused.h"
+#include "../rvv1024_decode_profile.h"
 
 #include "ggml.h"
 
@@ -106,11 +107,13 @@ bool prefill_kernel_ready() noexcept {
                 kc->nb[0] == 2 && vc->ne[3] == 1);
     const int64_t n_kv = kc->ne[2];
     if (kcols) {
+        const int64_t col_width = kcols->ne[0];
         GGML_ASSERT(kcols->type == GGML_TYPE_F16 && kcols->data &&
-                    kcols->ne[0] == 64 && kcols->ne[1] == HEAD_DIM &&
-                    kcols->ne[2] == N_KV_HEADS && kcols->ne[3] >= (n_kv + 63) / 64 &&
-                    kcols->nb[0] == 2 && kcols->nb[1] == 128 &&
-                    kcols->nb[2] == 16384 && kcols->nb[3] == 32768);
+                    (col_width == 64 || col_width == 128) && kcols->ne[1] == HEAD_DIM &&
+                    kcols->ne[2] == N_KV_HEADS && kcols->ne[3] >= (n_kv + col_width - 1) / col_width &&
+                    kcols->nb[0] == 2 && kcols->nb[1] == 2 * col_width &&
+                    kcols->nb[2] == HEAD_DIM * kcols->nb[1] &&
+                    kcols->nb[3] == N_KV_HEADS * kcols->nb[2]);
     }
     const bool v_trans = vc->nb[1] > vc->nb[2];
     GGML_ASSERT(((v_trans && vc->ne[0] == n_kv && vc->ne[1] == N_KV_HEADS && vc->ne[2] == HEAD_DIM) ||

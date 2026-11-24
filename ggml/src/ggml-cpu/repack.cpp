@@ -17,6 +17,7 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "rvv1024_decode_profile.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -5504,6 +5505,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
+        const bool decode_prof = ne11 == 1 && ne12 == 1 && ggml_rvvd_prof_active();
+        const uint64_t prof_t0 = rvvd_read_ticks(decode_prof);
+
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
@@ -5521,6 +5525,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
         }
+
+        const uint64_t prof_t1 = rvvd_read_ticks(decode_prof);
 
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
@@ -5564,6 +5570,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
 
         ggml_barrier(params->threadpool);
+        const uint64_t prof_t2 = rvvd_read_ticks(decode_prof);
 
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
@@ -5594,6 +5601,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, src1_start, src1_end);
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+        if (decode_prof) {
+            const uint64_t prof_t3 = rvvd_read_ticks(true);
+            ggml_rvvd_prof_record(RVVD_Q8, prof_t1 - prof_t0);
+            ggml_rvvd_prof_record(RVVD_MAT_SETUP_SYNC, prof_t2 - prof_t1);
+            ggml_rvvd_prof_record(RVVD_MAT_CHUNKS, prof_t3 - prof_t2);
         }
     }
 

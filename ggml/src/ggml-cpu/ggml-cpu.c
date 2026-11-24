@@ -17,6 +17,7 @@
 #include "tiled/tiled.h"
 
 #include "rvv1024_compare_profile.h"
+#include "rvv1024_decode_profile.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -3152,6 +3153,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    struct rvvd_run decode_profile;
+    rvvd_begin(&decode_profile, cgraph, state->ith);
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3163,6 +3167,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        int decode_bucket;
+        const uint64_t decode_t0 = rvvd_start(&decode_profile, node, &decode_bucket);
 
         const int rvv1024_bucket = rvv1024_compare_profile ? rvv1024_cmp_classify(node) : -1;
         const uint64_t rvv1024_t0 = rvv1024_bucket >= 0 ? rvv1024_cmp_tick() : 0;
@@ -3176,6 +3183,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_compute_forward(&params, node);
         }
 
+        rvvd_compute_done(&decode_profile, decode_bucket, decode_t0);
+
         if (rvv1024_bucket >= 0) {
             rvv1024_cmp_accumulate(rvv1024_bucket, rvv1024_cmp_tick() - rvv1024_t0);
         }
@@ -3188,6 +3197,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            rvvd_after_barrier(&decode_profile);
         }
     }
 
@@ -3198,6 +3208,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+    rvvd_end(&decode_profile);
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);

@@ -94,7 +94,8 @@
                             GGML_ASSERT(len > 0 && len <= 64 && (kb % 64) == 0);
                             const uint8_t * col_base =
                                 static_cast<const uint8_t *>(kcols->data) +
-                                (kb / 64) * kcols->nb[3] + kv_head * kcols->nb[2];
+                                (kb / kcols->ne[0]) * kcols->nb[3] + kv_head * kcols->nb[2] +
+                                (kb % kcols->ne[0]) * kcols->nb[0];
 
                             vfloat32m2_t s00 = __riscv_vfmv_v_f_f32m2(0.0f, lanes);
                             vfloat32m2_t s01 = s00, s02 = s00;
