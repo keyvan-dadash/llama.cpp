@@ -17,6 +17,8 @@ extern "C" {
 #endif
 bool ggml_rvvd_prof_active(void);
 void ggml_rvvd_prof_record(enum rvvd_phase phase, uint64_t ticks);
+void ggml_rvvd_ffn_perf_chunks_begin(void);
+void ggml_rvvd_ffn_perf_chunks_end(void);
 #ifdef __cplusplus
 }
 
@@ -78,6 +80,11 @@ static atomic_flag rvvd_registered = ATOMIC_FLAG_INIT;
 static _Thread_local int rvvd_tls_bucket = -1;
 static _Thread_local uint64_t rvvd_tls_ticks[RVVD_COUNT][RVVD_PHASE_COUNT];
 static _Thread_local uint64_t rvvd_tls_calls[RVVD_COUNT][RVVD_PHASE_COUNT];
+
+#include "rvv1024_ffn_perf.h"
+
+void ggml_rvvd_ffn_perf_chunks_begin(void) { rvvfp_start(2, rvvd_tls_bucket); }
+void ggml_rvvd_ffn_perf_chunks_end(void) { rvvfp_stop(2, rvvd_tls_bucket); }
 
 bool ggml_rvvd_prof_active(void) {
 #if defined(__riscv) && __riscv_xlen == 64
@@ -162,6 +169,7 @@ static uint64_t rvvd_timebase_hz(void) {
 static void rvvd_report(void) {
     const uint64_t graphs = atomic_load_explicit(&rvvd_graph_count, memory_order_relaxed);
     if (!graphs) return;
+    rvvfp_report(graphs);
     const uint64_t graph_ns = atomic_load_explicit(&rvvd_graph_ns, memory_order_relaxed);
     const uint64_t hz = rvvd_timebase_hz();
     uint64_t selected_ns = 0;
@@ -216,6 +224,7 @@ static inline void rvvd_begin(struct rvvd_run * r, const struct ggml_cgraph * g,
         rvvd_tls_bucket = -1;
         memset(rvvd_tls_ticks, 0, sizeof(rvvd_tls_ticks));
         memset(rvvd_tls_calls, 0, sizeof(rvvd_tls_calls));
+        rvvfp_graph_begin(ith);
     }
     if (r->primary) {
         if (!atomic_flag_test_and_set_explicit(&rvvd_registered, memory_order_relaxed)) atexit(rvvd_report);
@@ -226,13 +235,17 @@ static inline uint64_t rvvd_start(struct rvvd_run * r, const struct ggml_tensor 
     *bucket = -1;
     if (!r->mode || (!r->primary && r->mode != 2)) return 0;
     *bucket = rvvd_classify(n);
-    if (r->mode == 2) rvvd_tls_bucket = *bucket;
+    if (r->mode == 2) {
+        rvvd_tls_bucket = *bucket;
+        rvvfp_start(1, *bucket);
+    }
     return rvv1024_cmp_tick();
 }
 static inline void rvvd_compute_done(struct rvvd_run * r, int b, uint64_t start) {
     if (b < 0) return;
     const uint64_t ns = rvv1024_cmp_tick() - start;
     if (r->mode == 2) {
+        rvvfp_stop(1, b);
         rvvd_tls_bucket = -1;
         r->worker[b] += ns;
         r->calls[b]++;
@@ -253,6 +266,7 @@ static inline void rvvd_after_barrier(struct rvvd_run * r) {
 static inline void rvvd_end(struct rvvd_run * r) {
     if (!r->mode) return;
     rvvd_after_barrier(r); // last node uses the existing final graph barrier
+    if (r->mode == 2) rvvfp_graph_end();
     if (r->primary) {
         atomic_fetch_add_explicit(&rvvd_graph_ns, rvv1024_cmp_tick()-r->graph_start, memory_order_relaxed);
         atomic_fetch_add_explicit(&rvvd_graph_count, 1, memory_order_relaxed);

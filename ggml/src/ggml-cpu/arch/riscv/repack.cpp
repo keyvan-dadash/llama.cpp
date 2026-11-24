@@ -317,7 +317,93 @@ void ggml_gemv_q4_0_16x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_gemv_q4_0_32x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     ggml_gemv_q4_0_Mx1_q8_0<32>(n, s, bs, vx, vy, nr, nc);
 }
+
+// Experimental decode GEMV: same Q4_0 64x1 layout, split the low/high
+// accumulation chains by input index. No change to repacking or FP32 order.
+// Keep the variants out of line so perf can annotate them independently.
+static inline __attribute__((always_inline)) void ggml_q4_0_mac_pair_64(
+        const block<4, 64> & w, const block_q8_0 & a, int i,
+        vint16m1_t & lo, vint16m1_t & hi) {
+    constexpr size_t vl = 64;
+    const vint8mf2_t p = __riscv_vle8_v_i8mf2((const int8_t *)&w.qs[i * vl], vl);
+    const vint8mf2_t qlo = __riscv_vsra_vx_i8mf2(__riscv_vsll_vx_i8mf2(p, 4, vl), 4, vl);
+    const vint8mf2_t qhi = __riscv_vsra_vx_i8mf2(p, 4, vl);
+    lo = __riscv_vwmacc_vx_i16m1(lo, a.qs[i], qlo, vl);
+    hi = __riscv_vwmacc_vx_i16m1(hi, a.qs[16 + i], qhi, vl);
+}
+
+template<int NACC>
+static __attribute__((noinline)) void ggml_gemv_q4_0_64x1_acc_q8_0(
+        int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy, int nc) {
+    static_assert(NACC == 4 || NACC == 8, "Q4_0 accumulator count");
+    static_assert(QK4_0 == 32 && QK8_0 == 32, "Q4_0/Q8_0 block size");
+    constexpr size_t vl = 64;
+    assert(n % QK8_0 == 0);
+    assert(nc % vl == 0);
+    const int nb = n / QK8_0;
+    const block_q8_0 * a = (const block_q8_0 *) vy;
+    for (int x = 0; x < nc / 64; ++x) {
+        const block<4, 64> * w = (const block<4, 64> *) vx + x * nb;
+        vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, vl);
+        for (int b = 0; b < nb; ++b) {
+            vint16m1_t lo0 = __riscv_vmv_v_x_i16m1(0, vl);
+            vint16m1_t hi0 = lo0;
+            vint16m1_t lo1 = lo0;
+            vint16m1_t hi1 = lo0;
+            vint16m1_t lo2 = lo0;
+            vint16m1_t hi2 = lo0;
+            vint16m1_t lo3 = lo0;
+            vint16m1_t hi3 = lo0;
+
+            // The original inner loop is already fully unrolled on GCC.
+            // Explicitly request full unrolling for both experimental paths.
+            #pragma GCC unroll 8
+            for (int i = 0; i < 16; i += NACC / 2) {
+                ggml_q4_0_mac_pair_64(w[b], a[b], i + 0, lo0, hi0);
+                ggml_q4_0_mac_pair_64(w[b], a[b], i + 1, lo1, hi1);
+                if (NACC == 8) {
+                    ggml_q4_0_mac_pair_64(w[b], a[b], i + 2, lo2, hi2);
+                    ggml_q4_0_mac_pair_64(w[b], a[b], i + 3, lo3, hi3);
+                }
+            }
+
+            // Each low/high half contains 16 products, with |q4| <= 8
+            // and |q8| <= 128: every partial and half sum fits in int16.
+            // The full 32-product sum can reach +32768: widen the last add.
+            lo0 = __riscv_vadd_vv_i16m1(lo0, lo1, vl);
+            hi0 = __riscv_vadd_vv_i16m1(hi0, hi1, vl);
+            if (NACC == 8) {
+                lo2 = __riscv_vadd_vv_i16m1(lo2, lo3, vl);
+                hi2 = __riscv_vadd_vv_i16m1(hi2, hi3, vl);
+                lo0 = __riscv_vadd_vv_i16m1(lo0, lo2, vl);
+                hi0 = __riscv_vadd_vv_i16m1(hi0, hi2, vl);
+            }
+            const vint32m2_t sumi = __riscv_vwadd_vv_i32m2(lo0, hi0, vl);
+
+            // Same scale operations and superposition order as baseline.
+            const vfloat16m1_t wd = __riscv_vle16_v_f16m1((const _Float16 *)w[b].d, vl);
+            const vfloat32m2_t d = __riscv_vfwmul_vf_f32m2(wd, *(const _Float16 *)&a[b].d, vl);
+            sumf = __riscv_vfmacc_vv_f32m2(sumf, __riscv_vfcvt_f_x_v_f32m2(sumi, vl), d, vl);
+        }
+        __riscv_vse32_v_f32m2(s + x * 64, sumf, vl);
+    }
+}
+
 void ggml_gemv_q4_0_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    // Read once per process. Default and invalid values retain baseline.
+    static const int nacc = []() {
+        const char * e = std::getenv("GGML_RVV_Q4_0_GEMV_ACC");
+        return e && std::strcmp(e, "4") == 0 ? 4 : e && std::strcmp(e, "8") == 0 ? 8 : 2;
+    }();
+    if (nacc != 2 && __riscv_vlenb() == 128) {
+        if (nacc == 4) {
+            ggml_gemv_q4_0_64x1_acc_q8_0<4>(n, s, vx, vy, nc);
+        } else {
+            ggml_gemv_q4_0_64x1_acc_q8_0<8>(n, s, vx, vy, nc);
+        }
+        return;
+    }
     ggml_gemv_q4_0_Mx1_q8_0<64>(n, s, bs, vx, vy, nr, nc);
 }
 

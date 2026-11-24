@@ -5574,6 +5574,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
         const uint64_t prof_t2 = rvvd_read_ticks(decode_prof);
+        if (decode_prof) ggml_rvvd_ffn_perf_chunks_begin();
 
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
@@ -5606,6 +5607,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
         if (decode_prof) {
+            ggml_rvvd_ffn_perf_chunks_end();
             const uint64_t prof_t3 = rvvd_read_ticks(true);
             ggml_rvvd_prof_record(RVVD_Q8, prof_t1 - prof_t0);
             ggml_rvvd_prof_record(RVVD_MAT_SETUP_SYNC, prof_t2 - prof_t1);
