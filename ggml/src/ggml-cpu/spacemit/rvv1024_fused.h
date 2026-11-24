@@ -18,6 +18,7 @@ struct ggml_tensor;
 namespace spacemit_kernels::rvv::fused1024 {
 
 inline constexpr std::size_t VLEN_BYTES = 128;
+inline constexpr int64_t KCOL_WIDTH    = 128;
 inline constexpr int64_t HIDDEN_DIM     = 1536;
 inline constexpr int64_t HEAD_DIM       = 128;
 inline constexpr int64_t N_Q_HEADS      = 12;

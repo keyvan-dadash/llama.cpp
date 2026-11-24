@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "rvv1024_fused.h"
 
 #include <algorithm>
 #include <atomic>
@@ -245,18 +246,12 @@ llama_kv_cache::llama_kv_cache(
         // defaults to enabled, while an explicit GRAPH=0 disables it.
         // Without this allocation, graph reservation aborts on get_k_columns().
         const bool graph_requested = !graph_env || strcmp(graph_env, "0") != 0;
-        // Non-fused FlashAttention can share the fused kernel's producer-side
-        // FP16 K-column cache without enabling Q/attention/W_O graph fusion.
-        const char * fa_env = getenv("GGML_RVV_FA_KCOL");
-        const bool fa_kcol_requested = fa_env && strcmp(fa_env, "1") == 0;
-        if ((graph_requested || fa_kcol_requested) &&
+        if (graph_requested &&
             type_k == GGML_TYPE_F16 && buft == ggml_backend_cpu_buffer_type() &&
             !other && n_stream == 1 &&
             hparams.n_embd_head_k(il) == 128 && hparams.n_head_kv(il) == 2) {
-            // Optional BK128 K-column layout. Allocated once; writer and
-            // prefill readers support either width. Normal K remains intact.
-            const char * col_env = getenv("GGML_RVV1024_KCOL_WIDTH");
-            const int64_t col_width = col_env && strcmp(col_env, "128") == 0 ? 128 : 64;
+            // Fixed BK128 storage; prefill consumes its two BK64 halves.
+            const int64_t col_width = spacemit_kernels::rvv::fused1024::KCOL_WIDTH;
             k_columns = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
                                             col_width, 128, 2, (kv_size + col_width - 1) / col_width);
             ggml_format_name(k_columns, "cache_%skcols_l%d", name_tag, il);
@@ -1517,7 +1512,7 @@ static void rvv1024_k_columns_store_fn(ggml_tensor * dst, int ith, int nth, void
 
     const ggml_tensor * src = dst->src[0];    // post-RoPE K [256, n_tokens], often F32
     const ggml_tensor * idxs = dst->src[1];   // true cache slots per token
-    const ggml_tensor * cols = dst->src[2];   // [BK, 128, 2, ceil(kv_size/BK)]; BK=64/128
+    const ggml_tensor * cols = dst->src[2];   // [BK, 128, 2, ceil(kv_size/BK)]; BK=128
     const ggml_tensor * normal = dst->src[4]; // normal K [256, kv_size, 1]
     GGML_ASSERT(src && idxs && cols && normal && dst->src[3] &&
                 src->data && idxs->data && cols->data && normal->data);
@@ -1527,10 +1522,10 @@ static void rvv1024_k_columns_store_fn(ggml_tensor * dst, int ith, int nth, void
     GGML_ASSERT(idxs->type == GGML_TYPE_I64 && idxs->ne[0] == src->ne[1] &&
                 idxs->nb[0] == sizeof(int64_t));
     GGML_ASSERT(cols->type == GGML_TYPE_F16 &&
-                (cols->ne[0] == 64 || cols->ne[0] == 128) &&
+                cols->ne[0] == spacemit_kernels::rvv::fused1024::KCOL_WIDTH &&
                 cols->ne[1] == 128 && cols->ne[2] == 2 &&
                 cols->nb[0] == sizeof(uint16_t));
-    const int64_t col_width = cols->ne[0];
+    const int64_t col_width = spacemit_kernels::rvv::fused1024::KCOL_WIDTH;
     GGML_ASSERT(normal->type == GGML_TYPE_F16 && normal->ne[0] == 256 &&
                 normal->ne[2] == 1 && normal->nb[0] == sizeof(uint16_t));
 

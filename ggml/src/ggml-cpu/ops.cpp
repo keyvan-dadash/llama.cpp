@@ -9,7 +9,6 @@
 #include "vec.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -9080,32 +9079,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     }
 }
 
-// A/B-only: match the fused QK's 64-KV-lane FP16 widening FMA.  Q/K are
-// normal GGML tensors; K is transposed into per-thread scratch on every tile.
-// Neither Q projection, online softmax/PV, nor W_O is fused here.
-#if defined(__riscv_v) && defined(__riscv_zvfh)
-static inline void ggml_rvv_fa_qk_f16_x4(
-        float * dst0, float * dst1, float * dst2, float * dst3,
-        const _Float16 * q0, const _Float16 * q1, const _Float16 * q2, const _Float16 * q3,
-        const _Float16 * k_col, int64_t dk, int nkeys) {
-    const size_t vl = __riscv_vsetvl_e16m1(nkeys);
-    vfloat32m2_t a0 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
-    vfloat32m2_t a1 = a0, a2 = a0, a3 = a0;
-
-    for (int64_t d = 0; d < dk; ++d) {
-        const vfloat16m1_t kh = __riscv_vle16_v_f16m1(k_col + d * ggml_fa_tile_config::KV, vl);
-        a0 = __riscv_vfwmacc_vf_f32m2(a0, q0[d], kh, vl);
-        a1 = __riscv_vfwmacc_vf_f32m2(a1, q1[d], kh, vl);
-        a2 = __riscv_vfwmacc_vf_f32m2(a2, q2[d], kh, vl);
-        a3 = __riscv_vfwmacc_vf_f32m2(a3, q3[d], kh, vl);
-    }
-    __riscv_vse32_v_f32m2(dst0, a0, vl);
-    __riscv_vse32_v_f32m2(dst1, a1, vl);
-    __riscv_vse32_v_f32m2(dst2, a2, vl);
-    __riscv_vse32_v_f32m2(dst3, a3, vl);
-}
-#endif
-
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9183,41 +9156,6 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
 
-#if defined(__riscv_v) && defined(__riscv_zvfh)
-    // Explicit opt-in. The default GGML path is completely unchanged.
-    static const bool qk_f16_requested = []() {
-        const char * e = std::getenv("GGML_RVV_FA_QK_F16");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
-    const bool qk_f16 = qk_f16_requested && __riscv_vlenb() >= 128 &&
-                        q->type == GGML_TYPE_F32 && kv_type == GGML_TYPE_F16 &&
-                        DK == 128 && DV == 128 && KV_TILE_SZ == 64 && Q_TILE_SZ % 4 == 0;
-    // Optional shadow cache: [block][KV head][dimension][64 KV positions].
-    // Each vector load gets 64 keys; scores need no horizontal reduction.
-    const ggml_tensor * kcols = dst->src[6];
-    const bool qk_kcol = qk_f16 && kcols && !dst->src[5] && dst->src[7] &&
-                         kcols->type == GGML_TYPE_F16 &&
-                         kcols->ne[0] == KV_TILE_SZ && kcols->ne[1] == DK &&
-                         kcols->ne[2] == nek2 && kcols->ne[3] >= (nek1 + KV_TILE_SZ - 1) / KV_TILE_SZ &&
-                         kcols->nb[0] == sizeof(_Float16) &&
-                         kcols->nb[1] == KV_TILE_SZ * sizeof(_Float16) &&
-                         kcols->nb[2] == DK * kcols->nb[1] &&
-                         kcols->nb[3] == nek2 * kcols->nb[2] &&
-                         neq3 == 1 && nek3 == 1 && nev3 == 1;
-    if (qk_f16) {
-        static std::atomic_flag once_packed = ATOMIC_FLAG_INIT;
-        static std::atomic_flag once_columns = ATOMIC_FLAG_INIT;
-        auto & once = qk_kcol ? once_columns : once_packed;
-        if (!once.test_and_set(std::memory_order_relaxed)) {
-            std::fputs(qk_kcol
-                ? "[GGML FLASH_ATTN] FP16 QK 4-row x 64-KV using persistent K columns (NO tile transpose)\n"
-                : "[GGML FLASH_ATTN] FP16 QK 4-row x 64-KV widening FMA baseline (K packed per tile)\n", stderr);
-        }
-    }
-#else
-    const bool qk_kcol = false;
-#endif
-
     // with kv_rows the loop runs over the mask columns and reads K/V rows through kv_rows
     const ggml_tensor * kv_rows = dst->src[5];
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
@@ -9278,21 +9216,6 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         const int iv3 = iq3 / rv3;
         const int iv2 = iq2 / rv2;
 
-#if defined(__riscv_v) && defined(__riscv_zvfh)
-        if (qk_f16) {
-            // Match the fused path's FP16 Q representation after RoPE.
-            _Float16 * Q_f16 = (_Float16 *) Q_q;
-            for (int tq = 0; tq < tile_rows; ++tq) {
-                const float * pq = (const float *) ((char *) q->data + ((iq1 + tq)*nbq1 + iq2*nbq2 + iq3*nbq3));
-                for (int64_t d = 0; d < DK; ++d) {
-                    Q_f16[tq * DK + d] = (_Float16) pq[d];
-                }
-            }
-            for (int tq = tile_rows; tq < Q_TILE_SZ; ++tq) {
-                memset(Q_f16 + tq * DK, 0, DK * sizeof(_Float16));
-            }
-        } else
-#endif
         {
             float * Q_f32 = (float *)Q_q;
             for (int tq = 0; tq < tile_rows; tq++) {
@@ -9304,10 +9227,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             }
         }
 
-        // Persistent K columns no longer touch the K temporary tile.
-        if (!qk_kcol) {
-            memset(K_f32, 0, DK * KV_TILE_SZ * sizeof(float));
-        }
+        memset(K_f32, 0, DK * KV_TILE_SZ * sizeof(float));
         memset(V32, 0, KV_TILE_SZ * DV * sizeof(float));
 
         for (int64_t ic = 0; ic < n_kv_cols; ic += KV_TILE_SZ) {
@@ -9336,38 +9256,6 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             }
 
             memset(KQ, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
-#if defined(__riscv_v) && defined(__riscv_zvfh)
-            if (qk_f16) {
-                // Exact same four-query QK arithmetic in both modes:
-                // packed K scratch versus producer-written persistent columns.
-                const _Float16 * K_f16;
-                if (qk_kcol) {
-                    const uint8_t * col = (const uint8_t *) kcols->data +
-                                          (ic / KV_TILE_SZ) * kcols->nb[3] +
-                                          ik2 * kcols->nb[2];
-                    K_f16 = (const _Float16 *) col;
-                } else {
-                    _Float16 * scratch_k = (_Float16 *) K_f32;
-                    for (int tk = 0; tk < kv_tile; ++tk) {
-                        const char * kp = (const char *)k->data + kv_row(ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
-                        const ggml_fp16_t * src = (const ggml_fp16_t *) kp;
-                        for (int64_t d = 0; d < DK; ++d) {
-                            memcpy(scratch_k + d * KV_TILE_SZ + tk, src + d, sizeof(_Float16));
-                        }
-                    }
-                    K_f16 = scratch_k;
-                }
-                const _Float16 * Q_f16 = (const _Float16 *) Q_q;
-                for (int tq = 0; tq < Q_TILE_SZ; tq += 4) {
-                    ggml_rvv_fa_qk_f16_x4(
-                        KQ + (tq + 0) * KV_TILE_SZ, KQ + (tq + 1) * KV_TILE_SZ,
-                        KQ + (tq + 2) * KV_TILE_SZ, KQ + (tq + 3) * KV_TILE_SZ,
-                        Q_f16 + (tq + 0) * DK, Q_f16 + (tq + 1) * DK,
-                        Q_f16 + (tq + 2) * DK, Q_f16 + (tq + 3) * DK,
-                        K_f16, DK, kv_tile);
-                }
-            } else
-#endif
             {
                 // Original GGML F32 QK path (also reduction-free on RVV).
                 // Pack K tile transposed: K_f32[dk][kv].

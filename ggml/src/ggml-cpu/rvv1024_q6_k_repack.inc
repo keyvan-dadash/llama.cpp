@@ -108,76 +108,7 @@ static inline void q6k_tile(int nb, float * dst, const q6k_block_64 * w,
     __riscv_vse32_v_f32m2(dst, result, vl);
 }
 
-static inline bool q6k_repack_env(const char * name) {
-    const char * value = std::getenv(name);
-    return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
-// Independent reference in the original GGUF block order (not q6k_bits).
-// One superblock, so this also checks sign/scale/overflow without ambiguity
-// from a changed FP32 summation order across superblocks.
-static float q6k_reference_block(const block_q6_K & w, const block_q8_K & a) {
-    int32_t sum = 0;
-    for (int h = 0; h < 2; ++h) {
-        const uint8_t * ql = w.ql + h*64;
-        const uint8_t * qh = w.qh + h*32;
-        const int8_t * sc = w.scales + h*8;
-        const int8_t * q8 = a.qs + h*128;
-        for (int l = 0; l < 32; ++l) {
-            const int q0 = ((ql[l] & 15) | ((qh[l] & 3) << 4)) - 32;
-            const int q1 = ((ql[l+32] & 15) | (((qh[l] >> 2) & 3) << 4)) - 32;
-            const int q2 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-            const int q3 = ((ql[l+32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-            sum += q0 * q8[l] * sc[l/16];
-            sum += q1 * q8[l+32] * sc[l/16+2];
-            sum += q2 * q8[l+64] * sc[l/16+4];
-            sum += q3 * q8[l+96] * sc[l/16+6];
-        }
-    }
-    return (GGML_CPU_FP16_TO_FP32(w.d) * a.d) * (float) sum;
-}
-
-// Optional on-device test at load time, not in the timed decode. Test first,
-// middle and last output tiles, every superblock, and both Q8_K layouts.
-static void q6k_validate(const block_q6_K * src, const q6k_block_64 * packed, int64_t nb, int64_t tiles) {
-    const int64_t samples[] = {0, tiles/2, tiles-1};
-    int64_t checked = 0;
-    for (const int64_t tile : samples) {
-        for (int64_t b = 0; b < nb; ++b) {
-            block_q8_K a[4] = {};
-            block_q8_Kx4 a4 = {};
-            for (int r = 0; r < 4; ++r) {
-                a[r].d = r == 1 ? -0.25f : 0.125f;
-                a4.d[r] = a[r].d;
-                for (int k = 0; k < QK_K; ++k) {
-                    const int v = r == 0 ? -128 : r == 1 ? 127 : ((k*37 + r*53 + (int)(b%256)*11) & 255) - 128;
-                    a[r].qs[k] = (int8_t) v;
-                    a4.qs[4*k+r] = (int8_t) v;
-                    a[r].bsums[k/16] += v;
-                    a4.bsums[4*(k/16)+r] += v;
-                }
-            }
-            const auto * block = packed + tile*nb+b;
-            for (int r = 0; r < 4; ++r) {
-                float got[q6k_cols], got4[q6k_cols];
-                q6k_tile(1, got, block, &a[r], 0);
-                q6k_tile(1, got4, block, &a4, r);
-                for (int c = 0; c < q6k_cols; ++c) {
-                    const float expected = q6k_reference_block(src[(tile*q6k_cols+c)*nb+b], a[r]);
-                    if (got[c] != expected || got4[c] != expected) {
-                        std::fprintf(stderr, "[RVV1024] Q6_K validation FAILED tile=%lld block=%lld row=%d lane=%d ref=%.9g gemv=%.9g gemm=%.9g\n",
-                                     (long long) tile, (long long) b, r, c, expected, got[c], got4[c]);
-                        GGML_ASSERT(false);
-                    }
-                    ++checked;
-                }
-            }
-        }
-    }
-    std::fprintf(stderr, "[RVV1024] Q6_K validation PASS (%lld lane/block/activation checks; GEMV and GEMM layouts)\n", (long long) checked);
-}
-
-// Use existing repack buffer, scheduler, Q8_K quantizer and profiling.
+// Use existing repack buffer, scheduler and Q8_K quantizer.
 template <> int repack<block_q6_K, 1, 64>(ggml_tensor * t, const void * data, size_t data_size) {
     GGML_ASSERT(__riscv_vlenb() >= 128);
     GGML_ASSERT(t->ne[0] % QK_K == 0 && t->ne[1] % q6k_cols == 0);
@@ -197,9 +128,6 @@ template <> int repack<block_q6_K, 1, 64>(ggml_tensor * t, const void * data, si
     }
     std::fprintf(stderr, "[RVV1024] Q6_K 64x1 repack: %s, %lld x %lld, %zu bytes\n",
                  t->name, (long long) t->ne[0], (long long) t->ne[1], data_size);
-    if (q6k_repack_env("GGML_RVV1024_Q6_K_VALIDATE")) {
-        q6k_validate(src, dst, nb, tiles);
-    }
     return 0;
 }
 

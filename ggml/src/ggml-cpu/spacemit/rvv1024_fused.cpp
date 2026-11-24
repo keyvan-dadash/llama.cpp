@@ -1,5 +1,4 @@
 #include "rvv1024_fused.h"
-#include "../rvv1024_decode_profile.h"
 
 #include "ggml.h"
 
@@ -7,7 +6,6 @@
 #include <cstring>
 #include <atomic>
 #include <cstdio>
-#include <cstdlib>
 
 // GCC's standard RVV header, NOT the SpacemiT/IME intrinsic interface.
 #if defined(__riscv_v) && defined(__riscv_v_intrinsic)
@@ -87,7 +85,7 @@ bool prefill_kernel_ready() noexcept {
     const ggml_tensor * kc  = parts->src[4];  // FP16 [128, 2, n_kv, 1]
     const ggml_tensor * vc  = parts->src[5];  // FP16 normal or V-transposed
     const ggml_tensor * mask= parts->src[6];  // F16/F32 [n_kv, ntok, 1, 1]
-    const ggml_tensor * kcols= parts->src[8]; // optional [64 positions, 128 dims, 2 heads, blocks]
+    const ggml_tensor * kcols= parts->src[8]; // [128 positions, 128 dims, 2 heads, blocks]
     GGML_ASSERT(prepared && wq && wo && kc && vc && mask);
     GGML_ASSERT(prepared->type == GGML_TYPE_I8 && ggml_is_contiguous(prepared) &&
                 prepared->ne[0] == static_cast<int64_t>(sizeof(prefill_prepared_token)) &&
@@ -107,9 +105,9 @@ bool prefill_kernel_ready() noexcept {
                 kc->nb[0] == 2 && vc->ne[3] == 1);
     const int64_t n_kv = kc->ne[2];
     if (kcols) {
-        const int64_t col_width = kcols->ne[0];
+        constexpr int64_t col_width = KCOL_WIDTH;
         GGML_ASSERT(kcols->type == GGML_TYPE_F16 && kcols->data &&
-                    (col_width == 64 || col_width == 128) && kcols->ne[1] == HEAD_DIM &&
+                    kcols->ne[0] == col_width && kcols->ne[1] == HEAD_DIM &&
                     kcols->ne[2] == N_KV_HEADS && kcols->ne[3] >= (n_kv + col_width - 1) / col_width &&
                     kcols->nb[0] == 2 && kcols->nb[1] == 2 * col_width &&
                     kcols->nb[2] == HEAD_DIM * kcols->nb[1] &&

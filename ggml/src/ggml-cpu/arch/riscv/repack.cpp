@@ -318,9 +318,8 @@ void ggml_gemv_q4_0_32x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_gemv_q4_0_Mx1_q8_0<32>(n, s, bs, vx, vy, nr, nc);
 }
 
-// Experimental decode GEMV: same Q4_0 64x1 layout, split the low/high
-// accumulation chains by input index. No change to repacking or FP32 order.
-// Keep the variants out of line so perf can annotate them independently.
+// Four independent integer accumulators for VLEN1024 GEMV.
+// Preserve the Q4_0 64x1 layout, widening final sum and FP32 order.
 static inline __attribute__((always_inline)) void ggml_q4_0_mac_pair_64(
         const block<4, 64> & w, const block_q8_0 & a, int i,
         vint16m1_t & lo, vint16m1_t & hi) {
@@ -332,11 +331,9 @@ static inline __attribute__((always_inline)) void ggml_q4_0_mac_pair_64(
     hi = __riscv_vwmacc_vx_i16m1(hi, a.qs[16 + i], qhi, vl);
 }
 
-template<int NACC>
-static __attribute__((noinline)) void ggml_gemv_q4_0_64x1_acc_q8_0(
+static __attribute__((noinline)) void ggml_gemv_q4_0_64x1_acc4_q8_0(
         int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
         const void * GGML_RESTRICT vy, int nc) {
-    static_assert(NACC == 4 || NACC == 8, "Q4_0 accumulator count");
     static_assert(QK4_0 == 32 && QK8_0 == 32, "Q4_0/Q8_0 block size");
     constexpr size_t vl = 64;
     assert(n % QK8_0 == 0);
@@ -351,21 +348,12 @@ static __attribute__((noinline)) void ggml_gemv_q4_0_64x1_acc_q8_0(
             vint16m1_t hi0 = lo0;
             vint16m1_t lo1 = lo0;
             vint16m1_t hi1 = lo0;
-            vint16m1_t lo2 = lo0;
-            vint16m1_t hi2 = lo0;
-            vint16m1_t lo3 = lo0;
-            vint16m1_t hi3 = lo0;
 
-            // The original inner loop is already fully unrolled on GCC.
-            // Explicitly request full unrolling for both experimental paths.
+            // Fully unroll the eight iterations.
             #pragma GCC unroll 8
-            for (int i = 0; i < 16; i += NACC / 2) {
+            for (int i = 0; i < 16; i += 2) {
                 ggml_q4_0_mac_pair_64(w[b], a[b], i + 0, lo0, hi0);
                 ggml_q4_0_mac_pair_64(w[b], a[b], i + 1, lo1, hi1);
-                if (NACC == 8) {
-                    ggml_q4_0_mac_pair_64(w[b], a[b], i + 2, lo2, hi2);
-                    ggml_q4_0_mac_pair_64(w[b], a[b], i + 3, lo3, hi3);
-                }
             }
 
             // Each low/high half contains 16 products, with |q4| <= 8
@@ -373,12 +361,6 @@ static __attribute__((noinline)) void ggml_gemv_q4_0_64x1_acc_q8_0(
             // The full 32-product sum can reach +32768: widen the last add.
             lo0 = __riscv_vadd_vv_i16m1(lo0, lo1, vl);
             hi0 = __riscv_vadd_vv_i16m1(hi0, hi1, vl);
-            if (NACC == 8) {
-                lo2 = __riscv_vadd_vv_i16m1(lo2, lo3, vl);
-                hi2 = __riscv_vadd_vv_i16m1(hi2, hi3, vl);
-                lo0 = __riscv_vadd_vv_i16m1(lo0, lo2, vl);
-                hi0 = __riscv_vadd_vv_i16m1(hi0, hi2, vl);
-            }
             const vint32m2_t sumi = __riscv_vwadd_vv_i32m2(lo0, hi0, vl);
 
             // Same scale operations and superposition order as baseline.
@@ -391,17 +373,8 @@ static __attribute__((noinline)) void ggml_gemv_q4_0_64x1_acc_q8_0(
 }
 
 void ggml_gemv_q4_0_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    // Read once per process. Default and invalid values retain baseline.
-    static const int nacc = []() {
-        const char * e = std::getenv("GGML_RVV_Q4_0_GEMV_ACC");
-        return e && std::strcmp(e, "4") == 0 ? 4 : e && std::strcmp(e, "8") == 0 ? 8 : 2;
-    }();
-    if (nacc != 2 && __riscv_vlenb() == 128) {
-        if (nacc == 4) {
-            ggml_gemv_q4_0_64x1_acc_q8_0<4>(n, s, vx, vy, nc);
-        } else {
-            ggml_gemv_q4_0_64x1_acc_q8_0<8>(n, s, vx, vy, nc);
-        }
+    if (__riscv_vlenb() == 128) {
+        ggml_gemv_q4_0_64x1_acc4_q8_0(n, s, vx, vy, nc);
         return;
     }
     ggml_gemv_q4_0_Mx1_q8_0<64>(n, s, bs, vx, vy, nr, nc);
@@ -1536,14 +1509,9 @@ static void ggml_gemm_q4_0_64x1_q8_0_8tok(int n, float * GGML_RESTRICT s, size_t
 }
 
 void ggml_gemm_q4_0_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    // Default to the faster eight-token GEMM on VLEN1024. For a controlled
-    // A/B comparison, GGML_RVV_Q4_0_GEMM8=0 restores the four-token kernel.
-    // Other vector lengths and short tails still use the original kernel.
-    static const bool enable8 = []() {
-        const char * v = std::getenv("GGML_RVV_Q4_0_GEMM8");
-        return !(v && v[0] == '0' && v[1] == '\0');
-    }();
-    if (enable8 && __riscv_vlenb() >= 128 && nr >= 8) {
+    // Eight-token fast path; retain the four-token kernel for short tails
+    // and other supported vector lengths.
+    if (__riscv_vlenb() >= 128 && nr >= 8) {
         ggml_gemm_q4_0_64x1_q8_0_8tok(n, s, bs, vx, vy, nr, nc);
     } else {
         ggml_gemm_q4_0_Mx1_q8_0<64>(n, s, bs, vx, vy, nr, nc);

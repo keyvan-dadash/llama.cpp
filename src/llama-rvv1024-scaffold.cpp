@@ -1,6 +1,6 @@
 // Experimental Qwen2 RVV1024 graph *scaffold*.
 //
-// This file routes explicitly enabled prefill to an optional RVV CPU backend.
+// This file routes eligible prefill and single-token decode to an optional RVV CPU backend.
 // Unsupported builds and model configurations continue on normal Qwen2.
 //
 // Graph contract:
@@ -31,12 +31,6 @@ static bool rvv1024_graph_requested() {
     // Explicit GRAPH=0 remains available for a normal GGML A/B baseline.
     const char * env = std::getenv("LLAMA_RVV1024_GRAPH");
     return env == nullptr || std::strcmp(env, "0") != 0;
-}
-
-// Decode6 is strictly opt-in; all multi-token prefill is unchanged.
-static bool rvv1024_decode6_requested() {
-    const char * env = std::getenv("GGML_RVV1024_DECODE6");
-    return env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "4") == 0);
 }
 
 // Only enable the graph once the CPU backend explicitly reports it can run.
@@ -184,7 +178,7 @@ ggml_tensor * llm_graph_context::build_attn_rvv1024_qwen2(
     // model-lifetime packed I8 Q/W_O tensors. K/V uses GGML for now.
     if (n_embd != 1536 || n_head != 12 || n_head_kv != 2 ||
         n_embd_head_k != 128 || n_embd_head_v != 128 || n_rot != 128 ||
-        (n_tokens <= 1 && !(n_tokens == 1 && rvv1024_decode6_requested())) ||
+        n_tokens <= 0 ||
         ubatch.n_seqs_unq != 1 || cparams.training ||
         !cparams.causal_attn || rope_type != GGML_ROPE_TYPE_NEOX ||
         ext_factor != 0.0f || attn_factor != 1.0f ||

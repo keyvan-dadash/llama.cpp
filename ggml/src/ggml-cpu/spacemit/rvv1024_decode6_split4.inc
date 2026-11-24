@@ -10,7 +10,7 @@
 namespace {
 constexpr size_t D6_VL = 64;
 constexpr size_t D6_WO_VL = 128;
-constexpr int D6_BK_MAX = 128;
+constexpr int D6_BK = KCOL_WIDTH;
 constexpr int D6_H = 6;
 constexpr float D6_ATTN_SCALE = 0.08838834764831845f;
 static_assert(D6_H == N_Q_HEADS / N_KV_HEADS && Q_HEADS_TILE == 3 &&
@@ -32,36 +32,6 @@ static inline float d6_exp_neg(float x) {
     float pow2;
     __builtin_memcpy(&pow2, &ebits, sizeof(pow2));
     return p * pow2;
-}
-static inline float d6_max(vfloat32m2_t v, size_t lanes) {
-    const auto seed = __riscv_vfmv_v_f_f32m1(-__builtin_inff(), 1);
-    return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m2_f32m1(v, seed, lanes));
-}
-static inline float d6_sum(vfloat32m2_t v, size_t lanes) {
-    const auto seed = __riscv_vfmv_v_f_f32m1(0.0f, 1);
-    return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m2_f32m1(v, seed, lanes));
-}
-static inline vfloat32m2_t d6_exp_neg_vec(vfloat32m2_t x, size_t lanes) {
-    const vbool16_t keep = __riscv_vmfgt_vf_f32m2_b16(x, -85.0f, lanes);
-    const auto safe = __riscv_vfmax_vf_f32m2(x, -85.0f, lanes);
-    const auto z = __riscv_vfmul_vf_f32m2(safe, 1.4426950408889634f, lanes);
-    const auto n = __riscv_vfcvt_rtz_x_f_v_i32m2(
-        __riscv_vfsub_vf_f32m2(z, 0.5f, lanes), lanes);
-    const auto nf = __riscv_vfcvt_f_x_v_f32m2(n, lanes);
-    const auto r = __riscv_vfsub_vv_f32m2(safe,
-        __riscv_vfmul_vf_f32m2(nf, 0.6931471805599453f, lanes), lanes);
-    const auto horner = [&](vfloat32m2_t p, float c) -> vfloat32m2_t {
-        return __riscv_vfadd_vf_f32m2(__riscv_vfmul_vv_f32m2(p, r, lanes), c, lanes);
-    };
-    auto p = __riscv_vfmv_v_f_f32m2(1.0f/5040.0f, lanes);
-    p = horner(p,1.0f/720.0f);p = horner(p,1.0f/120.0f);
-    p = horner(p,1.0f/24.0f);p = horner(p,1.0f/6.0f);
-    p = horner(p,0.5f);p = horner(p,1.0f);p = horner(p,1.0f);
-    const auto powbits = __riscv_vsll_vx_i32m2(
-        __riscv_vadd_vx_i32m2(n, 127, lanes), 23, lanes);
-    const auto pow2 = __riscv_vreinterpret_v_i32m2_f32m2(powbits);
-    return __riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(0.0f, lanes),
-        __riscv_vfmul_vv_f32m2(p, pow2, lanes), keep, lanes);
 }
 static inline vint8mf2_t d6_quant32(vfloat32m2_t src, int upper, float & scale) {
     constexpr size_t N=Q4_BLOCK_SIZE;
@@ -169,7 +139,7 @@ static inline vfloat32m4_t d6_exp_neg_vec128(vfloat32m4_t x, size_t lanes) {
         __riscv_vfmul_vv_f32m4(p, pow2, lanes), keep, lanes);
 }
 
-// Keep PV64 as the control: half the 128 output dimensions at a time,
+// PV64: half the 128 output dimensions at a time,
 // six f32m2 accumulator vectors and one converted V vector.
 static void d6_pv64(const ggml_tensor * vc, int kv_head, bool v_trans,
                     ptrdiff_t v_step, int64_t kb, size_t lanes,
@@ -210,45 +180,6 @@ static void d6_pv64(const ggml_tensor * vc, int kv_head, bool v_trans,
     update_half(0);update_half(64);
 }
 
-// Optional independent experiment: keep all 128 V output dimensions in one
-// f32m4 U vector per head (24 registers), plus V f32m4 and f16m2 temporaries.
-// Tight register footprint; inspect GCC assembly for spilling on the A100.
-static void d6_pv128(const ggml_tensor * vc, int kv_head, bool v_trans,
-                     ptrdiff_t v_step, int64_t kb, size_t lanes,
-                     float u[D6_H][HEAD_DIM], const float p[D6_H][128],
-                     const float alpha[D6_H]) {
-    constexpr size_t VL128=128;
-    auto u0=__riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(u[0],VL128),alpha[0],VL128);
-    auto u1=__riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(u[1],VL128),alpha[1],VL128);
-    auto u2=__riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(u[2],VL128),alpha[2],VL128);
-    auto u3=__riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(u[3],VL128),alpha[3],VL128);
-    auto u4=__riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(u[4],VL128),alpha[4],VL128);
-    auto u5=__riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(u[5],VL128),alpha[5],VL128);
-    for(size_t j=0;j<lanes;j++){
-        if(p[0][j]==0.0f && p[1][j]==0.0f && p[2][j]==0.0f &&
-           p[3][j]==0.0f && p[4][j]==0.0f && p[5][j]==0.0f) continue;
-        const int64_t pos=kb+static_cast<int64_t>(j);
-        const uint8_t * vp=static_cast<const uint8_t *>(vc->data)+
-            (v_trans?pos*vc->nb[0]+kv_head*vc->nb[1]:pos*vc->nb[2]+kv_head*vc->nb[1]);
-        const auto vb=v_step==2?
-            __riscv_vle16_v_u16m2(reinterpret_cast<const uint16_t *>(vp),VL128):
-            __riscv_vlse16_v_u16m2(reinterpret_cast<const uint16_t *>(vp),v_step,VL128);
-        const auto v=__riscv_vfwcvt_f_f_v_f32m4(__riscv_vreinterpret_v_u16m2_f16m2(vb),VL128);
-        u0=__riscv_vfmacc_vf_f32m4(u0,p[0][j],v,VL128);
-        u1=__riscv_vfmacc_vf_f32m4(u1,p[1][j],v,VL128);
-        u2=__riscv_vfmacc_vf_f32m4(u2,p[2][j],v,VL128);
-        u3=__riscv_vfmacc_vf_f32m4(u3,p[3][j],v,VL128);
-        u4=__riscv_vfmacc_vf_f32m4(u4,p[4][j],v,VL128);
-        u5=__riscv_vfmacc_vf_f32m4(u5,p[5][j],v,VL128);
-    }
-    __riscv_vse32_v_f32m4(u[0],u0,VL128);
-    __riscv_vse32_v_f32m4(u[1],u1,VL128);
-    __riscv_vse32_v_f32m4(u[2],u2,VL128);
-    __riscv_vse32_v_f32m4(u[3],u3,VL128);
-    __riscv_vse32_v_f32m4(u[4],u4,VL128);
-    __riscv_vse32_v_f32m4(u[5],u5,VL128);
-}
-
 static void d6_attention_split(ggml_tensor * out, int worker) {
     const auto * q=out->src[0];
     const auto * kc=out->src[1];
@@ -264,11 +195,11 @@ static void d6_attention_split(ggml_tensor * out, int worker) {
         q->ne[0]==HEAD_DIM && q->ne[1]==N_Q_HEADS &&
         kc && kc->type==GGML_TYPE_F16 && kc->ne[0]==HEAD_DIM && kc->ne[1]==N_KV_HEADS &&
         vc && vc->type==GGML_TYPE_F16 && mask && cols &&
-        cols->type==GGML_TYPE_F16 && (cols->ne[0]==64 || cols->ne[0]==128) &&
+        cols->type==GGML_TYPE_F16 && cols->ne[0]==D6_BK &&
         cols->ne[1]==HEAD_DIM && cols->ne[2]==N_KV_HEADS &&
         cols->nb[0]==2 && cols->nb[1]==2*cols->ne[0] &&
         mask->ne[1]>=1 && (mask->type==GGML_TYPE_F16 || mask->type==GGML_TYPE_F32));
-    const int bk=static_cast<int>(cols->ne[0]);
+    constexpr int bk=D6_BK;
     const int64_t n_kv=kc->ne[2];
     const int64_t blocks=(n_kv+bk-1)/bk;
     const int64_t split=((blocks+1)/2)*bk;
@@ -283,65 +214,20 @@ static void d6_attention_split(ggml_tensor * out, int worker) {
                 mask->nb[0]==(mask->type==GGML_TYPE_F16?2u:4u));
     const auto * qall=reinterpret_cast<const _Float16 *>(q->data);
     alignas(64) float u[D6_H][HEAD_DIM]={};
-    alignas(64) float p[D6_H][D6_BK_MAX];
-    alignas(64) float scores128[D6_H][D6_BK_MAX];
+    alignas(64) float p[D6_H][D6_BK];
+    alignas(64) float scores128[D6_H][D6_BK];
     float m[D6_H],l[D6_H],alpha[D6_H];
     for(int h=0;h<D6_H;h++){m[h]=-__builtin_inff();l[h]=0.0f;}
     const auto read_q=[&](int h,int d)->_Float16 {
         return qall[(kv_head*D6_H+h)*HEAD_DIM+d];
     };
-    // Read once per attention op: PV128 can be compared independently of KCOL width.
-    const char * pv_env=std::getenv("GGML_RVV1024_PV128");
-    const bool pv128=pv_env && std::strcmp(pv_env,"1")==0;
-    const bool decode_prof = ggml_rvvd_prof_active();
-    uint64_t prof_qk=0, prof_store=0, prof_softmax=0, prof_pv=0;
     for(int64_t kb=begin;kb<end;kb+=bk){
         const size_t lanes=static_cast<size_t>(end-kb<bk?end-kb:bk);
         const uint8_t * kbase=static_cast<const uint8_t *>(cols->data)+
             (kb/bk)*cols->nb[3]+kv_head*cols->nb[2];
         const uint8_t * mp=static_cast<const uint8_t *>(mask->data)+kb*mask->nb[0];
         bool any_valid=false;
-        const uint64_t prof_t0 = rvvd_read_ticks(decode_prof);
-        uint64_t prof_tqk = 0, prof_tstore = 0;
-        if(bk==64){
-            // Original BK64 path, same six f32m2 score accumulators.
-            auto s0=__riscv_vfmv_v_f_f32m2(0.0f,lanes);
-            vfloat32m2_t s1=s0,s2=s0,s3=s0,s4=s0,s5=s0;
-            for(int d=0;d<HEAD_DIM;d++){
-                const auto kh=__riscv_vreinterpret_v_u16m1_f16m1(
-                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(kbase+d*cols->nb[1]),lanes));
-                s0=__riscv_vfwmacc_vf_f32m2(s0,read_q(0,d),kh,lanes);
-                s1=__riscv_vfwmacc_vf_f32m2(s1,read_q(1,d),kh,lanes);
-                s2=__riscv_vfwmacc_vf_f32m2(s2,read_q(2,d),kh,lanes);
-                s3=__riscv_vfwmacc_vf_f32m2(s3,read_q(3,d),kh,lanes);
-                s4=__riscv_vfwmacc_vf_f32m2(s4,read_q(4,d),kh,lanes);
-                s5=__riscv_vfwmacc_vf_f32m2(s5,read_q(5,d),kh,lanes);
-            }
-            prof_tqk = rvvd_read_ticks(decode_prof);
-            prof_tstore = prof_tqk;
-            const auto mv=mask->type==GGML_TYPE_F32?
-                __riscv_vle32_v_f32m2(reinterpret_cast<const float *>(mp),lanes):
-                __riscv_vfwcvt_f_f_v_f32m2(__riscv_vreinterpret_v_u16m1_f16m1(
-                    __riscv_vle16_v_u16m1(reinterpret_cast<const uint16_t *>(mp),lanes)),lanes);
-            const auto finalize=[&](int h,vfloat32m2_t scores){
-                scores=__riscv_vfadd_vv_f32m2(__riscv_vfmul_vf_f32m2(scores,D6_ATTN_SCALE,lanes),mv,lanes);
-                const float mx=d6_max(scores,lanes);
-                if(mx==-__builtin_inff()){
-                    alpha[h]=1.0f;
-                    for(size_t j=0;j<lanes;j++)p[h][j]=0.0f;
-                    return;
-                }
-                any_valid=true;
-                const float nm=mx>m[h]?mx:m[h];
-                const float a=(l[h]>0.0f&&nm>m[h])?d6_exp_neg(m[h]-nm):1.0f;
-                alpha[h]=a;m[h]=nm;
-                const auto w=d6_exp_neg_vec(__riscv_vfsub_vf_f32m2(scores,nm,lanes),lanes);
-                __riscv_vse32_v_f32m2(p[h],w,lanes);
-                l[h]=l[h]*a+d6_sum(w,lanes);
-            };
-            finalize(0,s0);finalize(1,s1);finalize(2,s2);
-            finalize(3,s3);finalize(4,s4);finalize(5,s5);
-        } else {
+        {
             // Six m4 QK accumulators; no transpose in the hot loop.
             // Explicit score stores free the 24-register live set before softmax.
             {
@@ -357,14 +243,12 @@ static void d6_attention_split(ggml_tensor * out, int worker) {
                     s4=__riscv_vfwmacc_vf_f32m4(s4,read_q(4,d),kh,lanes);
                     s5=__riscv_vfwmacc_vf_f32m4(s5,read_q(5,d),kh,lanes);
                 }
-                prof_tqk = rvvd_read_ticks(decode_prof);
                 __riscv_vse32_v_f32m4(scores128[0],s0,lanes);
                 __riscv_vse32_v_f32m4(scores128[1],s1,lanes);
                 __riscv_vse32_v_f32m4(scores128[2],s2,lanes);
                 __riscv_vse32_v_f32m4(scores128[3],s3,lanes);
                 __riscv_vse32_v_f32m4(scores128[4],s4,lanes);
                 __riscv_vse32_v_f32m4(scores128[5],s5,lanes);
-                prof_tstore = rvvd_read_ticks(decode_prof);
             }
             const auto mv=mask->type==GGML_TYPE_F32?
                 __riscv_vle32_v_f32m4(reinterpret_cast<const float *>(mp),lanes):
@@ -388,22 +272,8 @@ static void d6_attention_split(ggml_tensor * out, int worker) {
                 l[h]=l[h]*a+d6_sum128(w,lanes);
             }
         }
-        const uint64_t prof_tsoft = rvvd_read_ticks(decode_prof);
-        if (decode_prof) {
-            prof_qk += prof_tqk - prof_t0;
-            prof_store += prof_tstore - prof_tqk;
-            prof_softmax += prof_tsoft - prof_tstore;
-        }
         if(!any_valid) continue;
-        if(pv128) d6_pv128(vc,kv_head,v_trans,v_step,kb,lanes,u,p,alpha);
-        else      d6_pv64(vc,kv_head,v_trans,v_step,kb,lanes,u,p,alpha);
-        if (decode_prof) prof_pv += rvvd_read_ticks(true) - prof_tsoft;
-    }
-    if (decode_prof) {
-        ggml_rvvd_prof_record(RVVD_QK, prof_qk);
-        if (bk==128) ggml_rvvd_prof_record(RVVD_SCORE_STORE, prof_store);
-        ggml_rvvd_prof_record(RVVD_SOFTMAX, prof_softmax);
-        ggml_rvvd_prof_record(RVVD_PV, prof_pv);
+        d6_pv64(vc,kv_head,v_trans,v_step,kb,lanes,u,p,alpha);
     }
     for(int h=0;h<D6_H;h++){
         auto * dst=reinterpret_cast<float *>(static_cast<uint8_t *>(out->data)+
@@ -427,8 +297,6 @@ static void d6_merge_and_wo(ggml_tensor * out, int group) {
     const int head_offset=(group%2)*Q_HEADS_TILE;
     alignas(64) int8_t q8[WO_BLOCKS_PER_Q_GROUP][Q4_BLOCK_SIZE];
     float scales[WO_BLOCKS_PER_Q_GROUP];
-    const bool decode_prof = ggml_rvvd_prof_active();
-    const uint64_t prof_t0 = rvvd_read_ticks(decode_prof);
     for(int h=0;h<Q_HEADS_TILE;h++){
         const int hh=head_offset+h;
         const auto * a=reinterpret_cast<const float *>(static_cast<const uint8_t *>(states->data)+
@@ -454,7 +322,6 @@ static void d6_merge_and_wo(ggml_tensor * out, int group) {
             __riscv_vse8_v_i8mf2(q8[base+1],d6_quant32(v,1,scales[base+1]),Q4_BLOCK_SIZE);
         }
     }
-    const uint64_t prof_t1 = rvvd_read_ticks(decode_prof);
     // One three-head packed W_O shard per worker, exactly as in prefill.
     const uint8_t * wg=static_cast<const uint8_t *>(wo->data)+group*WO_GROUP_BYTES;
     float * y=reinterpret_cast<float *>(static_cast<uint8_t *>(out->data)+group*out->nb[2]);
@@ -485,11 +352,6 @@ static void d6_merge_and_wo(ggml_tensor * out, int group) {
         __riscv_vse32_v_f32m4(y+yt*WO_SUBTILE_OUTPUTS,lo,D6_WO_VL);
         __riscv_vse32_v_f32m4(y+yt*WO_SUBTILE_OUTPUTS+D6_WO_VL,hi,D6_WO_VL);
     }
-    if (decode_prof) {
-        const uint64_t prof_t2 = rvvd_read_ticks(true);
-        ggml_rvvd_prof_record(RVVD_MERGE_Q8, prof_t1 - prof_t0);
-        ggml_rvvd_prof_record(RVVD_WO, prof_t2 - prof_t1);
-    }
 }
 } // anonymous namespace
 #endif // RVV+Zvfh
@@ -512,11 +374,8 @@ void forward_decode6_attention(ggml_tensor * out,int ith,int nth,void * userdata
     if(ith==0){
         static std::atomic_flag once=ATOMIC_FLAG_INIT;
         if(!once.test_and_set(std::memory_order_relaxed)) {
-            const auto * cols = out->src[5];
-            const char * pv = std::getenv("GGML_RVV1024_PV128");
             std::fprintf(stderr,
-                "[RVV1024] decode6-split4: 4 workers, H6 each, 2 history partitions/KV head, BK%lld PV%s\n",
-                static_cast<long long>(cols ? cols->ne[0] : 0), pv && std::strcmp(pv, "1") == 0 ? "128" : "64");
+                "[RVV1024] decode6-split4: 4 workers, H6 each, 2 history partitions/KV head, BK128 PV64\n");
         }
     }
     for(int g=ith;g<DECODE6_WORKERS;g+=nth)d6_attention_split(out,g);
