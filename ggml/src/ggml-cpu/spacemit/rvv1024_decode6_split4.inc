@@ -50,7 +50,23 @@ static inline vint8mf2_t d6_quant32(vfloat32m2_t src, int upper, float & scale) 
     return __riscv_vncvt_x_x_w_i8mf2(__riscv_vncvt_x_x_w_i16m1(qi,N),N);
 }
 
-static void d6_project_one_group(ggml_tensor * out, int group) {
+// Decode Q uses output-paired nibbles (not the ordinary repack ABI).
+// Preserve that layout and the original scale/RoPE arithmetic.
+static inline __attribute__((always_inline)) void d6_q_mac_column(
+        const uint8_t * col, int8_t a, vint16m1_t & lo, vint16m1_t & hi) {
+    const auto packed = __riscv_vle8_v_u8mf2(col,D6_VL);
+    const auto wlo = __riscv_vreinterpret_v_u8mf2_i8mf2(
+        __riscv_vsub_vx_u8mf2(__riscv_vand_vx_u8mf2(packed,15,D6_VL),8,D6_VL));
+    const auto whi = __riscv_vreinterpret_v_u8mf2_i8mf2(
+        __riscv_vsub_vx_u8mf2(__riscv_vsrl_vx_u8mf2(packed,4,D6_VL),8,D6_VL));
+    lo = __riscv_vwmacc_vx_i16m1(lo,a,wlo,D6_VL);
+    hi = __riscv_vwmacc_vx_i16m1(hi,a,whi,D6_VL);
+}
+
+// Compile the old and experimental kernels separately. No mode checks in
+// the hot loops. Both consume the same weights and prepared input.
+template<bool ACC4>
+static __attribute__((noinline)) void d6_project_one_group(ggml_tensor * out, int group) {
     const auto * prepared = out->src[0];
     const auto * wq = out->src[1];
     const auto * bias = out->src[2];
@@ -72,15 +88,34 @@ static void d6_project_one_group(ggml_tensor * out, int group) {
             const auto * block = wg + static_cast<size_t>(b)*Q_BLOCK_BYTES;
             auto isumlo = __riscv_vmv_v_x_i16m1(0,D6_VL);
             auto isumhi = __riscv_vmv_v_x_i16m1(0,D6_VL);
-            for (int k = 0; k < Q4_BLOCK_SIZE; ++k) {
-                const auto * col = block + k*Q_COL_BYTES + h*(HEAD_DIM/2);
-                const auto packed = __riscv_vle8_v_u8mf2(col,D6_VL);
-                const auto wlo = __riscv_vreinterpret_v_u8mf2_i8mf2(
-                    __riscv_vsub_vx_u8mf2(__riscv_vand_vx_u8mf2(packed,15,D6_VL),8,D6_VL));
-                const auto whi = __riscv_vreinterpret_v_u8mf2_i8mf2(
-                    __riscv_vsub_vx_u8mf2(__riscv_vsrl_vx_u8mf2(packed,4,D6_VL),8,D6_VL));
-                isumlo = __riscv_vwmacc_vx_i16m1(isumlo,x->x8[b].qs[k],wlo,D6_VL);
-                isumhi = __riscv_vwmacc_vx_i16m1(isumhi,x->x8[b].qs[k],whi,D6_VL);
+            if constexpr (ACC4) {
+                auto isumlo1 = isumlo;
+                auto isumhi1 = isumhi;
+                const auto * head = block + h*(HEAD_DIM/2);
+                const auto & a = x->x8[b];
+                // Even/odd columns form four independent i16 chains.
+                // Unroll pairs just as in the ordinary ACC4 GEMV.
+                #pragma GCC unroll 16
+                for (int k = 0; k < Q4_BLOCK_SIZE; k += 2) {
+                    d6_q_mac_column(head + k*Q_COL_BYTES, a.qs[k], isumlo, isumhi);
+                    d6_q_mac_column(head + (k+1)*Q_COL_BYTES, a.qs[k+1], isumlo1, isumhi1);
+                }
+                // Preparation clamps Q8 to [-127,127]; Q4 is [-8,7].
+                // 16 products <= 16256 in magnitude, 32 <= 32512.
+                // Each half is a DIFFERENT output, so never sum lo with hi.
+                isumlo = __riscv_vadd_vv_i16m1(isumlo,isumlo1,D6_VL);
+                isumhi = __riscv_vadd_vv_i16m1(isumhi,isumhi1,D6_VL);
+            } else {
+                for (int k = 0; k < Q4_BLOCK_SIZE; ++k) {
+                    const auto * col = block + k*Q_COL_BYTES + h*(HEAD_DIM/2);
+                    const auto packed = __riscv_vle8_v_u8mf2(col,D6_VL);
+                    const auto wlo = __riscv_vreinterpret_v_u8mf2_i8mf2(
+                        __riscv_vsub_vx_u8mf2(__riscv_vand_vx_u8mf2(packed,15,D6_VL),8,D6_VL));
+                    const auto whi = __riscv_vreinterpret_v_u8mf2_i8mf2(
+                        __riscv_vsub_vx_u8mf2(__riscv_vsrl_vx_u8mf2(packed,4,D6_VL),8,D6_VL));
+                    isumlo = __riscv_vwmacc_vx_i16m1(isumlo,x->x8[b].qs[k],wlo,D6_VL);
+                    isumhi = __riscv_vwmacc_vx_i16m1(isumhi,x->x8[b].qs[k],whi,D6_VL);
+                }
             }
             const float * scales = reinterpret_cast<const float *>(block+Q4_BLOCK_SIZE*Q_COL_BYTES)+h*HEAD_DIM;
             const float sx=x->x8[b].scale;
@@ -361,7 +396,19 @@ void forward_decode6_q(ggml_tensor * out,int ith,int nth,void * userdata){
     (void)userdata;
 #if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_zvfh)
     GGML_ASSERT(hardware_vlen_supported() && nth>0 && ith>=0 && ith<nth);
-    for(int g=ith;g<N_Q_GROUPS;g+=nth)d6_project_one_group(out,g);
+    // One process-lifetime choice; set before starting llama-bench.
+    static const bool acc4 = [] {
+        const char * env = std::getenv("GGML_RVV1024_DECODE_Q_ACC");
+        GGML_ASSERT(!env || std::strcmp(env,"2") == 0 || std::strcmp(env,"4") == 0);
+        const bool enabled = env && std::strcmp(env,"4") == 0;
+        std::fprintf(stderr,"[RVV1024] decode6 Q projection: ACC%d\n",enabled ? 4 : 2);
+        return enabled;
+    }();
+    if (acc4) {
+        for(int g=ith;g<N_Q_GROUPS;g+=nth)d6_project_one_group<true>(out,g);
+    } else {
+        for(int g=ith;g<N_Q_GROUPS;g+=nth)d6_project_one_group<false>(out,g);
+    }
 #else
     (void)out;(void)ith;(void)nth;
     GGML_ABORT("RVV1024 decode Q requires RVV1024 + Zvfh");
